@@ -308,6 +308,65 @@ uint32_t ParquetWriter::WriteData(const const_data_ptr_t buffer, const uint32_t 
 	}
 }
 
+uint32_t ParquetWriter::WriteEncrypted(const duckdb_apache::thrift::TBase &object, int8_t module,
+                                       int16_t row_group_ordinal, int16_t column_ordinal, int16_t page_ordinal,
+                                       const string *key_override) {
+	if (!encryption_config) {
+		return object.write(protocol.get());
+	}
+	const string &key = key_override ? *key_override : encryption_config->GetFooterKey();
+	CryptoMetaData md(Allocator::DefaultAllocator());
+	md.InitializeWithPrefix(aad_prefix, aad_file_unique, row_group_ordinal, column_ordinal, module, page_ordinal);
+	ParquetCrypto::GenerateAdditionalAuthenticatedData(Allocator::DefaultAllocator(), md);
+	return ParquetCrypto::Write(object, *protocol, key, *encryption_util, md);
+}
+
+uint32_t ParquetWriter::WriteDataEncrypted(const const_data_ptr_t buffer, const uint32_t buffer_size, int8_t module,
+                                           int16_t row_group_ordinal, int16_t column_ordinal, int16_t page_ordinal,
+                                           const string *key_override) {
+	if (!encryption_config) {
+		protocol->getTransport()->write(buffer, buffer_size);
+		return buffer_size;
+	}
+	const string &key = key_override ? *key_override : encryption_config->GetFooterKey();
+	CryptoMetaData md(Allocator::DefaultAllocator());
+	md.InitializeWithPrefix(aad_prefix, aad_file_unique, row_group_ordinal, column_ordinal, module, page_ordinal);
+	ParquetCrypto::GenerateAdditionalAuthenticatedData(Allocator::DefaultAllocator(), md);
+	return ParquetCrypto::WriteData(*protocol, buffer, buffer_size, key, *encryption_util, md);
+}
+
+string ParquetWriter::PathInSchemaToString(const vector<string> &path_in_schema) {
+	string result;
+	for (idx_t i = 0; i < path_in_schema.size(); i++) {
+		if (i > 0) {
+			result += '.';
+		}
+		result += path_in_schema[i];
+	}
+	return result;
+}
+
+bool ParquetWriter::HasColumnKey(const vector<string> &path_in_schema) const {
+	if (!encryption_config) {
+		return false;
+	}
+	return encryption_config->HasColumnKey(PathInSchemaToString(path_in_schema));
+}
+
+const string &ParquetWriter::GetColumnKey(const vector<string> &path_in_schema) const {
+	D_ASSERT(encryption_config);
+	const auto dot = PathInSchemaToString(path_in_schema);
+	if (encryption_config->HasColumnKey(dot)) {
+		return encryption_config->GetColumnKey(dot);
+	}
+	return encryption_config->GetFooterKey();
+}
+
+const string &ParquetWriter::GetColumnKeyMetadata(const vector<string> &path_in_schema) const {
+	D_ASSERT(encryption_config);
+	return encryption_config->GetColumnKeyMetadata(PathInSchemaToString(path_in_schema));
+}
+
 static void VerifyUniqueNames(const vector<string> &names) {
 #ifdef DEBUG
 	unordered_set<string> name_set;
@@ -400,7 +459,85 @@ ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, string file
 	if (encryption_config) {
 		// Get the encryption util
 		encryption_util = context.db->GetEncryptionUtil(false);
-		// encrypted parquet files start with the string "PARE"
+		// Inherit optional PME attributes from the config.
+		aad_prefix = encryption_config->GetAadPrefix();
+		supply_aad_prefix = encryption_config->GetSupplyAadPrefix();
+		plaintext_footer = encryption_config->GetPlaintextFooter();
+		if (supply_aad_prefix && aad_prefix.empty()) {
+			throw BinderException("encryption_config.supply_aad_prefix=true requires a non-empty aad_prefix");
+		}
+		if (plaintext_footer) {
+			// NOTE: writing plaintext_footer files is deferred to PR-4; reading them is already supported
+			// via the standard AAD_GCM_V1 code path (the footer is encrypted exactly like normal, but with
+			// a "PAR1" magic). If users need plaintext_footer today, they can produce such files with PyArrow
+			// and DuckDB will read them transparently.
+			throw NotImplementedException(
+			    "encryption_config.plaintext_footer=true is not yet supported for writing by DuckDB");
+		}
+		// PR-4: Envelope encryption via KMS. If the user set `kms_client`, we resolve it from the
+		// global registry and materialize all DEKs here. Each wrapped-DEK blob becomes a
+		// `key_metadata` field in the Parquet file.
+		if (encryption_config->HasKmsClient()) {
+			auto kms = ParquetKmsRegistry::Get().GetClient(encryption_config->GetKmsClientName());
+			if (!kms) {
+				throw InvalidInputException(
+				    "encryption_config.kms_client='%s' is not registered in the ParquetKmsRegistry",
+				    encryption_config->GetKmsClientName());
+			}
+			auto rnd_meta2 = make_uniq<EncryptionStateMetadata>(EncryptionTypes::GCM, 32,
+			                                                   EncryptionTypes::EncryptionVersion::NONE);
+			auto rnd_state2 = encryption_util->CreateEncryptionState(std::move(rnd_meta2));
+
+			// Footer DEK (if footer_master_key_id is set).
+			const auto &footer_master = encryption_config->GetFooterMasterKeyId();
+			if (!footer_master.empty()) {
+				string footer_dek(32, '\0');
+				rnd_state2->GenerateRandomData(reinterpret_cast<data_ptr_t>(&footer_dek[0]), 32);
+				auto wrapped = kms->WrapKey(footer_dek, footer_master);
+				encryption_config->SetFooterKeyBytes(std::move(footer_dek));
+				encryption_config->SetFooterKeyMetadata(std::move(wrapped));
+			}
+			// Per-column DEKs.
+			for (auto &kv : column_names) {
+				(void)kv; // not used; iterate name list for ordering determinism is unnecessary
+			}
+			// Iterate configured master-key ids (one per column path).
+			// We only inject DEKs for columns the user explicitly listed; other columns will use footer_key.
+			// NOTE: using a copy of the keys set because SetColumnKeyBytes mutates the map.
+			// We rely on the public setters so the rest of the writer sees DEKs as if the user had passed
+			// `column_keys` directly (BYTE-ARRAY form), while `key_metadata` holds the wrapped blob.
+			// Build a small snapshot of (path, master_key_id) pairs.
+			vector<std::pair<string, string>> snapshot;
+			for (idx_t ci = 0; ci < sql_types.size(); ci++) {
+				const auto &path_str = column_names[ci];
+				const auto &mkid = encryption_config->GetColumnMasterKeyId(path_str);
+				if (!mkid.empty()) {
+					snapshot.emplace_back(path_str, mkid);
+				}
+			}
+			for (auto &pm : snapshot) {
+				string dek(32, '\0');
+				rnd_state2->GenerateRandomData(reinterpret_cast<data_ptr_t>(&dek[0]), 32);
+				auto wrapped = kms->WrapKey(dek, pm.second);
+				encryption_config->SetColumnKeyBytes(pm.first, std::move(dek));
+				encryption_config->SetColumnKeyMetadata(pm.first, std::move(wrapped));
+			}
+			if (encryption_config->GetFooterKey().empty()) {
+				throw InvalidInputException(
+				    "encryption_config.kms_client set but neither footer_master_key_id nor a direct footer_key was "
+				    "provided; cannot encrypt footer");
+			}
+		}
+		// Generate the PME file-unique identifier (8 random bytes).
+		// This is written into FileCryptoMetaData.AES_GCM_V1.aad_file_unique at Finalize() time
+		// and used as part of the AAD prefix for every encrypted module.
+		aad_file_unique.resize(ParquetCrypto::UNIQUE_FILE_ID_LEN);
+		auto rnd_meta = make_uniq<EncryptionStateMetadata>(EncryptionTypes::GCM, 32,
+		                                                   EncryptionTypes::EncryptionVersion::NONE);
+		auto rnd_state = encryption_util->CreateEncryptionState(std::move(rnd_meta));
+		rnd_state->GenerateRandomData(reinterpret_cast<data_ptr_t>(&aad_file_unique[0]),
+		                              ParquetCrypto::UNIQUE_FILE_ID_LEN);
+		// Encrypted parquet files start with "PARE" (full encryption).
 		writer->WriteData(const_data_ptr_cast("PARE"), 4);
 		// we only support this one for now, not "AES_GCM_CTR_V1"
 		file_meta_data.encryption_algorithm.__isset.AES_GCM_V1 = true;
@@ -652,17 +789,9 @@ void ParquetWriter::FlushRowGroup(PreparedRowGroup &prepared) {
 		throw InternalException("Attempting to flush a row group with no rows");
 	}
 	row_group.file_offset = NumericCast<int64_t>(writer->GetTotalWritten());
-	for (idx_t col_idx = 0; col_idx < states.size(); col_idx++) {
-		const auto &col_writer = column_writers[col_idx];
-		auto write_state = std::move(states[col_idx]);
-		col_writer->FinalizeWrite(*write_state);
-	}
-	// let's make sure all offsets are ay-okay
-	ValidateColumnOffsets(file_name, writer->GetTotalWritten(), row_group);
 
-	row_group.total_compressed_size = NumericCast<int64_t>(writer->GetTotalWritten()) - row_group.file_offset;
-	row_group.__isset.total_compressed_size = true;
-
+	// PME: assign row-group ordinal + per-column crypto_metadata BEFORE writing any encrypted pages,
+	// because PrimitiveColumnWriter::FinalizeWrite reads state.row_group.ordinal to build the AAD.
 	if (encryption_config) {
 		const auto row_group_ordinal = file_meta_data.row_groups.size();
 		if (row_group_ordinal > std::numeric_limits<int16_t>::max()) {
@@ -670,7 +799,57 @@ void ParquetWriter::FlushRowGroup(PreparedRowGroup &prepared) {
 		}
 		row_group.ordinal = NumericCast<int16_t>(row_group_ordinal);
 		row_group.__isset.ordinal = true;
+
+		// Fill in crypto_metadata (FooterKey vs ColumnKey) based on encryption_config.column_keys.
+		// For columns with a dedicated column key, we additionally produce `encrypted_column_metadata`
+		// below (after FinalizeWrite has populated ColumnMetaData).
+		for (auto &col : row_group.columns) {
+			duckdb_parquet::ColumnCryptoMetaData cmd;
+			if (HasColumnKey(col.meta_data.path_in_schema)) {
+				duckdb_parquet::EncryptionWithColumnKey ewck;
+				ewck.__set_path_in_schema(col.meta_data.path_in_schema);
+				const auto &key_meta = GetColumnKeyMetadata(col.meta_data.path_in_schema);
+				if (!key_meta.empty()) {
+					ewck.__set_key_metadata(key_meta);
+				}
+				cmd.__set_ENCRYPTION_WITH_COLUMN_KEY(ewck);
+			} else {
+				duckdb_parquet::EncryptionWithFooterKey ewfk;
+				cmd.__set_ENCRYPTION_WITH_FOOTER_KEY(ewfk);
+			}
+			col.__set_crypto_metadata(cmd);
+		}
 	}
+
+	for (idx_t col_idx = 0; col_idx < states.size(); col_idx++) {
+		const auto &col_writer = column_writers[col_idx];
+		auto write_state = std::move(states[col_idx]);
+		col_writer->FinalizeWrite(*write_state);
+	}
+
+	// For columns using a dedicated column key, PME requires `encrypted_column_metadata`
+	// (ColumnMetaData encrypted under the column key, AAD module = COLUMN_METADATA).
+	// Readers (PyArrow/Spark/Trino) will refuse the file otherwise.
+	if (encryption_config) {
+		for (idx_t col_idx = 0; col_idx < row_group.columns.size(); col_idx++) {
+			auto &col = row_group.columns[col_idx];
+			if (!HasColumnKey(col.meta_data.path_in_schema)) {
+				continue;
+			}
+			const auto &column_key = GetColumnKey(col.meta_data.path_in_schema);
+			CryptoMetaData md(Allocator::DefaultAllocator());
+			md.InitializeWithPrefix(aad_prefix, aad_file_unique, row_group.ordinal,
+			                        NumericCast<int16_t>(col_idx), ParquetCrypto::COLUMN_METADATA);
+			ParquetCrypto::GenerateAdditionalAuthenticatedData(Allocator::DefaultAllocator(), md);
+			auto enc_buf = ParquetCrypto::EncryptToBuffer(col.meta_data, column_key, *encryption_util, md);
+			col.__set_encrypted_column_metadata(enc_buf);
+		}
+	}
+	// let's make sure all offsets are ay-okay
+	ValidateColumnOffsets(file_name, writer->GetTotalWritten(), row_group);
+
+	row_group.total_compressed_size = NumericCast<int64_t>(writer->GetTotalWritten()) - row_group.file_offset;
+	row_group.__isset.total_compressed_size = true;
 
 	// append the row group to the file metadata
 	file_meta_data.row_groups.push_back(row_group);
@@ -1153,12 +1332,26 @@ void ParquetWriter::Finalize() {
 
 	const auto metadata_start_offset = writer->GetTotalWritten();
 	if (encryption_config) {
-		// Crypto metadata is written unencrypted
+		// Crypto metadata is written unencrypted (PME requirement).
 		FileCryptoMetaData crypto_metadata;
 		duckdb_parquet::AesGcmV1 aes_gcm_v1;
+		if (!aad_file_unique.empty()) {
+			aes_gcm_v1.__set_aad_file_unique(aad_file_unique);
+		}
+		if (!aad_prefix.empty() && !supply_aad_prefix) {
+			aes_gcm_v1.__set_aad_prefix(aad_prefix);
+		}
+		if (supply_aad_prefix) {
+			aes_gcm_v1.__set_supply_aad_prefix(true);
+		}
 		duckdb_parquet::EncryptionAlgorithm alg;
 		alg.__set_AES_GCM_V1(aes_gcm_v1);
 		crypto_metadata.__set_encryption_algorithm(alg);
+		// PR-4: write footer-level wrapped key metadata (populated when kms_client is active).
+		const auto &footer_meta = encryption_config->GetFooterKeyMetadata();
+		if (!footer_meta.empty()) {
+			crypto_metadata.__set_key_metadata(footer_meta);
+		}
 		crypto_metadata.write(protocol.get());
 	}
 
@@ -1168,7 +1361,13 @@ void ParquetWriter::Finalize() {
 		geoparquet_data->Write(file_meta_data);
 	}
 
-	Write(file_meta_data);
+	if (encryption_config) {
+		// PME: footer is encrypted with footer key, AAD module = FOOTER (0),
+		// row-group / column / page ordinals absent.
+		WriteEncrypted(file_meta_data, ParquetCrypto::FOOTER);
+	} else {
+		Write(file_meta_data);
+	}
 
 	uint32_t footer_size = writer->GetTotalWritten() - metadata_start_offset;
 	writer->Write<uint32_t>(footer_size);

@@ -235,18 +235,70 @@ bool ColumnReader::PageIsFilteredOut(PageHeader &page_hdr) {
 	return true;
 }
 
+void ColumnReader::InitializeCryptoMetadata(const duckdb_parquet::EncryptionAlgorithm &encryption_algorithm,
+                                            idx_t row_group_ordinal_p) {
+	std::string aad_prefix;
+	std::string unique_file_identifier;
+	if (encryption_algorithm.__isset.AES_GCM_V1) {
+		unique_file_identifier = encryption_algorithm.AES_GCM_V1.aad_file_unique;
+		if (encryption_algorithm.AES_GCM_V1.__isset.aad_prefix) {
+			aad_prefix = encryption_algorithm.AES_GCM_V1.aad_prefix;
+		}
+	} else if (encryption_algorithm.__isset.AES_GCM_CTR_V1) {
+		throw InternalException("File is encrypted with AES_GCM_CTR_V1, but this is not supported by DuckDB");
+	} else {
+		throw InternalException("File is encrypted but no encryption algorithm is set");
+	}
+
+	// Reset per-column crypto context (fresh AAD + fresh page counter).
+	aad_crypto_metadata = CryptoMetaData(reader.allocator);
+	aad_crypto_metadata.InitializeWithPrefix(aad_prefix, unique_file_identifier,
+	                                         NumericCast<int16_t>(row_group_ordinal_p),
+	                                         NumericCast<int16_t>(ColumnIndex()));
+	current_page_counter = 0;
+}
+
 void ColumnReader::ReadEncrypted(duckdb_apache::thrift::TBase &object) {
 	aad_crypto_metadata.module = ParquetCrypto::GetModuleHeader(*chunk, aad_crypto_metadata.page_ordinal);
 	aad_crypto_metadata.page_ordinal =
 	    ParquetCrypto::GetFinalPageOrdinal(*chunk, aad_crypto_metadata.module, aad_crypto_metadata.page_ordinal);
-	reader.ReadEncrypted(object, *protocol, aad_crypto_metadata);
+	// PR-2: if this ColumnChunk uses a dedicated column key, resolve the key from encryption_config.
+	const string *key_override = nullptr;
+	string resolved_key;
+	if (chunk->__isset.crypto_metadata &&
+	    chunk->crypto_metadata.__isset.ENCRYPTION_WITH_COLUMN_KEY) {
+		const auto &ewck = chunk->crypto_metadata.ENCRYPTION_WITH_COLUMN_KEY;
+		const auto dot = StringUtil::Join(ewck.path_in_schema, ".");
+		if (!reader.parquet_options.encryption_config->HasColumnKey(dot)) {
+			throw InvalidInputException(
+			    "Parquet column '%s' is encrypted with a dedicated column key, but no column_keys entry was provided",
+			    dot);
+		}
+		resolved_key = reader.parquet_options.encryption_config->GetColumnKey(dot);
+		key_override = &resolved_key;
+	}
+	reader.ReadEncrypted(object, *protocol, aad_crypto_metadata, key_override);
 }
 
 void ColumnReader::ReadDataEncrypted(const data_ptr_t buffer, const uint32_t buffer_size, PageType::type page_type) {
 	aad_crypto_metadata.module = ParquetCrypto::GetModule(*chunk, page_type, aad_crypto_metadata.page_ordinal);
 	aad_crypto_metadata.page_ordinal =
 	    ParquetCrypto::GetFinalPageOrdinal(*chunk, aad_crypto_metadata.module, aad_crypto_metadata.page_ordinal);
-	reader.ReadDataEncrypted(*protocol, buffer, buffer_size, aad_crypto_metadata);
+	const string *key_override = nullptr;
+	string resolved_key;
+	if (chunk->__isset.crypto_metadata &&
+	    chunk->crypto_metadata.__isset.ENCRYPTION_WITH_COLUMN_KEY) {
+		const auto &ewck = chunk->crypto_metadata.ENCRYPTION_WITH_COLUMN_KEY;
+		const auto dot = StringUtil::Join(ewck.path_in_schema, ".");
+		if (!reader.parquet_options.encryption_config->HasColumnKey(dot)) {
+			throw InvalidInputException(
+			    "Parquet column '%s' is encrypted with a dedicated column key, but no column_keys entry was provided",
+			    dot);
+		}
+		resolved_key = reader.parquet_options.encryption_config->GetColumnKey(dot);
+		key_override = &resolved_key;
+	}
+	reader.ReadDataEncrypted(*protocol, buffer, buffer_size, aad_crypto_metadata, key_override);
 }
 
 void ColumnReader::Read(PageHeader &page_hdr) {
@@ -572,11 +624,12 @@ void ColumnReader::BeginRead(data_ptr_t define_out, data_ptr_t repeat_out) {
 
 idx_t ColumnReader::ReadPageHeaders(idx_t max_read, optional_ptr<const TableFilter> filter,
                                     optional_ptr<TableFilterState> filter_state) {
-	int8_t page_ordinal = 0;
 	while (page_rows_available == 0) {
-		aad_crypto_metadata.page_ordinal = page_ordinal;
+		// Use the per-column PERSISTED page counter so that subsequent batches continue to produce
+		// the correct AAD for PME encryption. See InitializeCryptoMetadata() for the reset point.
+		aad_crypto_metadata.page_ordinal = current_page_counter;
 		PrepareRead(filter, filter_state);
-		page_ordinal++;
+		current_page_counter++;
 	}
 	return MinValue<idx_t>(MinValue<idx_t>(max_read, page_rows_available), STANDARD_VECTOR_SIZE);
 }

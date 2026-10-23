@@ -61,7 +61,14 @@ static void ParseParquetFooter(data_ptr_t buffer, const string &file_path, idx_t
 	if (memcmp(buffer + 4, "PAR1", 4) == 0) {
 		footer_encrypted = false;
 		if (encryption_config) {
-			throw InvalidInputException("File '%s' is not encrypted, but 'encryption_config' was set", file_path);
+			// NOTE: PME `plaintext_footer=true` files also end with "PAR1". We currently do not support
+			// reading them (the footer-signature verification step is not implemented). Emit a precise
+			// error so users can distinguish this from the "unencrypted file" case.
+			throw InvalidInputException(
+			    "File '%s' ends with the plaintext magic 'PAR1' but 'encryption_config' was set. If this is a "
+			    "PME plaintext_footer file, note that DuckDB only supports reading fully-encrypted (PARE) files "
+			    "today; convert the file or re-encrypt with plaintext_footer=false.",
+			    file_path);
 		}
 	} else if (memcmp(buffer + 4, "PARE", 4) == 0) {
 		footer_encrypted = true;
@@ -156,19 +163,130 @@ LoadMetadata(ClientContext &context, Allocator &allocator, CachingFileHandle &fi
 		crypto_metadata->read(file_proto.get());
 
 		if (crypto_metadata->encryption_algorithm.__isset.AES_GCM_CTR_V1) {
-			throw InvalidInputException("File '%s' is encrypted with AES_GCM_CTR_V1, but only AES_GCM_V1 is supported",
-			                            file_handle.GetPath());
+			throw InvalidInputException(
+			    "Parquet file '%s' uses the AES_GCM_CTR_V1 variant of Parquet Modular Encryption, which DuckDB "
+			    "does not support. Use a tool like PyArrow to rewrite the file with AES_GCM_V1 encryption instead.",
+			    file_handle.GetPath());
 		}
-		auto file_aad = crypto_metadata->encryption_algorithm.AES_GCM_V1.aad_file_unique;
+		const auto &aes_gcm_v1 = crypto_metadata->encryption_algorithm.AES_GCM_V1;
+		const auto &file_aad = aes_gcm_v1.aad_file_unique;
+		std::string aad_prefix;
+		const bool supply_aad_prefix =
+		    aes_gcm_v1.__isset.supply_aad_prefix && aes_gcm_v1.supply_aad_prefix;
+		if (aes_gcm_v1.__isset.aad_prefix) {
+			aad_prefix = aes_gcm_v1.aad_prefix;
+		}
+		// PR-3: external aad_prefix handling. The user may supply aad_prefix via
+		// `encryption_config.aad_prefix`. Rules:
+		//   - If supply_aad_prefix=true in the file, user MUST supply it externally.
+		//   - If the file stored an aad_prefix inline AND the user also supplied one,
+		//     they must match (defense against file-replacement attacks).
+		const auto &user_aad_prefix = encryption_config->GetAadPrefix();
+		if (supply_aad_prefix) {
+			if (user_aad_prefix.empty()) {
+				throw InvalidInputException(
+				    "Parquet file '%s' requires an externally supplied aad_prefix (supply_aad_prefix=true), "
+				    "but none was provided in encryption_config.aad_prefix",
+				    file_handle.GetPath());
+			}
+			aad_prefix = user_aad_prefix;
+		} else if (!user_aad_prefix.empty()) {
+			if (!aad_prefix.empty() && aad_prefix != user_aad_prefix) {
+				throw InvalidInputException(
+				    "Parquet file '%s' aad_prefix stored in FileCryptoMetaData does not match the "
+				    "user-supplied encryption_config.aad_prefix",
+				    file_handle.GetPath());
+			}
+			aad_prefix = user_aad_prefix;
+		}
+		// PR-4: KMS envelope encryption. If a kms_client was configured, use it to unwrap the DEKs
+		// stored as `key_metadata` fields. We mutate a non-const reference back into the config so
+		// the rest of the reader (which looks up GetFooterKey() / GetColumnKey()) sees DEKs transparently.
+		if (encryption_config->HasKmsClient()) {
+			auto kms = ParquetKmsRegistry::Get().GetClient(encryption_config->GetKmsClientName());
+			if (!kms) {
+				throw InvalidInputException(
+				    "encryption_config.kms_client='%s' is not registered in the ParquetKmsRegistry",
+				    encryption_config->GetKmsClientName());
+			}
+			if (crypto_metadata->__isset.key_metadata && !crypto_metadata->key_metadata.empty()) {
+				const auto &footer_master = encryption_config->GetFooterMasterKeyId();
+				if (footer_master.empty()) {
+					throw InvalidInputException(
+					    "Parquet file '%s' has FileCryptoMetaData.key_metadata but no footer_master_key_id was "
+					    "provided",
+					    file_handle.GetPath());
+				}
+				auto footer_dek = kms->UnwrapKey(crypto_metadata->key_metadata, footer_master);
+				const_cast<ParquetEncryptionConfig &>(*encryption_config).SetFooterKeyBytes(std::move(footer_dek));
+			}
+		}
 		CryptoMetaData aad_crypto_metadata = CryptoMetaData(allocator);
 
-		if (!file_aad.empty()) {
-			aad_crypto_metadata.Initialize(file_aad);
+		if (!file_aad.empty() || !aad_prefix.empty()) {
+			aad_crypto_metadata.InitializeWithPrefix(aad_prefix, file_aad);
 			aad_crypto_metadata.SetModule(ParquetCrypto::FOOTER);
 		}
 		ParquetCrypto::GenerateAdditionalAuthenticatedData(allocator, aad_crypto_metadata);
 		ParquetCrypto::Read(*metadata, *file_proto, encryption_config->GetFooterKey(), *encryption_util,
 		                    aad_crypto_metadata);
+
+		// PR-2: resolve per-column keys. For any ColumnChunk with ENCRYPTION_WITH_COLUMN_KEY, decrypt
+		// its `encrypted_column_metadata` under the matching column key and overwrite `col.meta_data`
+		// so that the rest of the reader can treat it as plaintext from this point on.
+		for (idx_t rg = 0; rg < metadata->row_groups.size(); rg++) {
+			auto &row_group = metadata->row_groups[rg];
+			for (idx_t ci = 0; ci < row_group.columns.size(); ci++) {
+				auto &col = row_group.columns[ci];
+				if (!col.__isset.crypto_metadata) {
+					continue;
+				}
+				if (!col.crypto_metadata.__isset.ENCRYPTION_WITH_COLUMN_KEY) {
+					continue;
+				}
+				const auto &ewck = col.crypto_metadata.ENCRYPTION_WITH_COLUMN_KEY;
+				if (!col.__isset.encrypted_column_metadata || col.encrypted_column_metadata.empty()) {
+					throw InvalidInputException(
+					    "Parquet file '%s' uses column-key encryption on column '%s' but encrypted_column_metadata "
+					    "is missing",
+					    file_handle.GetPath(), StringUtil::Join(ewck.path_in_schema, "."));
+				}
+				const auto dot = StringUtil::Join(ewck.path_in_schema, ".");
+				// PR-4: if a kms_client is configured and the column has wrapped key_metadata, unwrap it.
+				if (encryption_config->HasKmsClient() && ewck.__isset.key_metadata &&
+				    !ewck.key_metadata.empty()) {
+					auto kms2 = ParquetKmsRegistry::Get().GetClient(encryption_config->GetKmsClientName());
+					const auto &col_master = encryption_config->GetColumnMasterKeyId(dot);
+					if (col_master.empty()) {
+						throw InvalidInputException(
+						    "Parquet file '%s' column '%s' has wrapped key_metadata but no column_master_key_ids "
+						    "entry was configured",
+						    file_handle.GetPath(), dot);
+					}
+					auto col_dek = kms2->UnwrapKey(ewck.key_metadata, col_master);
+					const_cast<ParquetEncryptionConfig &>(*encryption_config)
+					    .SetColumnKeyBytes(dot, std::move(col_dek));
+				}
+				if (!encryption_config->HasColumnKey(dot)) {
+					throw InvalidInputException(
+					    "Parquet file '%s' column '%s' is encrypted with a dedicated column key, but no column_keys "
+					    "entry for this path was provided in encryption_config",
+					    file_handle.GetPath(), dot);
+				}
+				const auto &col_key = encryption_config->GetColumnKey(dot);
+				CryptoMetaData col_md(allocator);
+				if (!file_aad.empty() || !aad_prefix.empty()) {
+					col_md.InitializeWithPrefix(aad_prefix, file_aad, NumericCast<int16_t>(rg),
+					                            NumericCast<int16_t>(ci), ParquetCrypto::COLUMN_METADATA);
+				}
+				ParquetCrypto::GenerateAdditionalAuthenticatedData(allocator, col_md);
+				duckdb_parquet::ColumnMetaData decrypted;
+				ParquetCrypto::DecryptFromBuffer(decrypted, col.encrypted_column_metadata, col_key,
+				                                 *encryption_util, col_md);
+				col.meta_data = std::move(decrypted);
+				col.__isset.meta_data = true;
+			}
+		}
 	} else {
 		metadata->read(file_proto.get());
 	}
@@ -1035,10 +1153,10 @@ uint32_t ParquetReader::Read(duckdb_apache::thrift::TBase &object, TProtocol &ip
 }
 
 uint32_t ParquetReader::ReadEncrypted(duckdb_apache::thrift::TBase &object, TProtocol &iprot,
-                                      CryptoMetaData &aad_crypto_metadata) const {
+                                      CryptoMetaData &aad_crypto_metadata, const string *key_override) const {
 	ParquetCrypto::GenerateAdditionalAuthenticatedData(allocator, aad_crypto_metadata);
-	return ParquetCrypto::Read(object, iprot, parquet_options.encryption_config->GetFooterKey(), *encryption_util,
-	                           aad_crypto_metadata);
+	const string &key = key_override ? *key_override : parquet_options.encryption_config->GetFooterKey();
+	return ParquetCrypto::Read(object, iprot, key, *encryption_util, aad_crypto_metadata);
 }
 
 uint32_t ParquetReader::ReadData(duckdb_apache::thrift::protocol::TProtocol &iprot, const data_ptr_t buffer,
@@ -1047,10 +1165,11 @@ uint32_t ParquetReader::ReadData(duckdb_apache::thrift::protocol::TProtocol &ipr
 }
 
 uint32_t ParquetReader::ReadDataEncrypted(duckdb_apache::thrift::protocol::TProtocol &iprot, const data_ptr_t buffer,
-                                          const uint32_t buffer_size, CryptoMetaData &aad_crypto_metadata) const {
+                                          const uint32_t buffer_size, CryptoMetaData &aad_crypto_metadata,
+                                          const string *key_override) const {
 	ParquetCrypto::GenerateAdditionalAuthenticatedData(allocator, aad_crypto_metadata);
-	return ParquetCrypto::ReadData(iprot, buffer, buffer_size, parquet_options.encryption_config->GetFooterKey(),
-	                               *encryption_util, aad_crypto_metadata);
+	const string &key = key_override ? *key_override : parquet_options.encryption_config->GetFooterKey();
+	return ParquetCrypto::ReadData(iprot, buffer, buffer_size, key, *encryption_util, aad_crypto_metadata);
 }
 
 static idx_t GetRowGroupOffset(const ParquetReader &reader, idx_t group_idx) {
@@ -1195,11 +1314,11 @@ void ParquetReader::PrepareRowGroupBuffer(ParquetReaderScanState &state, idx_t i
 	auto column_id = column_ids[col_idx];
 	auto &column_reader = state.root_reader->Cast<StructColumnReader>().GetChildReader(column_id);
 
-	// keep track of column and row group ordinal if data is encrypted
-	if (metadata->crypto_metadata->encryption_algorithm.__isset.AES_GCM_CTR_V1) {
-		column_reader.InitializeCryptoMetadata(metadata->crypto_metadata->encryption_algorithm,
-		                                       GetGroup(state).ordinal);
-	}
+	// NOTE: crypto metadata is initialized lazily right before Read()/Select() in the main scan loop
+	// (see the AES_GCM_V1 branches further below), not here. This block previously tried to initialize
+	// it under an AES_GCM_CTR_V1 condition that is always false (CTR_V1 is rejected at footer read time),
+	// so the code was dead and additionally dereferenced metadata->crypto_metadata which is null for
+	// plaintext files. Dropped for clarity.
 
 	if (filters) {
 		auto stats = column_reader.Stats(state.group_idx_list[state.current_group], group.columns);

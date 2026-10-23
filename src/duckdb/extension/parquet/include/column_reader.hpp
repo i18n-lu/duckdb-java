@@ -96,19 +96,10 @@ public:
 		return column_schema.max_repeat;
 	}
 
+	//! Resets AAD state for this column before reading its chunk. Implementation lives in the .cpp
+	//! because it dereferences `reader.allocator` and ParquetReader is only forward-declared here.
 	void InitializeCryptoMetadata(const duckdb_parquet::EncryptionAlgorithm &encryption_algorithm,
-	                              idx_t row_group_ordinal_p) {
-		std::string unique_file_identifier;
-		if (encryption_algorithm.__isset.AES_GCM_V1) {
-			unique_file_identifier = encryption_algorithm.AES_GCM_V1.aad_file_unique;
-		} else if (encryption_algorithm.__isset.AES_GCM_CTR_V1) {
-			throw InternalException("File is encrypted with AES_GCM_CTR_V1, but this is not supported by DuckDB");
-		} else {
-			throw InternalException("File is encrypted but no encryption algorithm is set");
-		}
-
-		aad_crypto_metadata.Initialize(unique_file_identifier, row_group_ordinal_p, ColumnIndex());
-	}
+	                              idx_t row_group_ordinal_p);
 
 	virtual idx_t FileOffset() const;
 	virtual uint64_t TotalCompressedSize();
@@ -336,6 +327,10 @@ private:
 	DeltaByteArrayDecoder delta_byte_array_decoder;
 	ByteStreamSplitDecoder byte_stream_split_decoder;
 	CryptoMetaData aad_crypto_metadata;
+	//! Per-column page counter including the dictionary / index / bloom pages. Passed to
+	//! ParquetCrypto::GetModuleHeader / GetFinalPageOrdinal to resolve the final AAD page ordinal.
+	//! Persisted across ReadPageHeaders() calls so multi-batch reads of PME files produce correct AAD.
+	int16_t current_page_counter = 0;
 
 	//! Resizeable buffers used for the various encodings above
 	ResizeableBuffer encoding_buffers[2];

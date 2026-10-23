@@ -178,8 +178,43 @@ public:
 	}
 	void AnalyzeSchema(ColumnDataCollection &buffer, vector<unique_ptr<ColumnWriter>> &column_writers);
 
+	//! Legacy write paths. If encryption_config is set, these use the legacy no-AAD mode
+	//! (compatible with pre-1.5.4 DuckDB-produced files, but not PME-spec-compliant).
+	//! New code should use WriteEncrypted/WriteDataEncrypted when encryption is enabled.
 	uint32_t Write(const duckdb_apache::thrift::TBase &object);
 	uint32_t WriteData(const const_data_ptr_t buffer, const uint32_t buffer_size);
+
+	//! PME-compliant encrypted write. module is one of ParquetCrypto::FOOTER / COLUMN_METADATA / ...
+	//! When encryption_config is NOT set, falls back to plain write (module/ordinals ignored).
+	//! Optional key_override: if non-null, use this key instead of footer_key (used for column-level
+	//! encryption). The key bytes must stay alive for the duration of this call.
+	uint32_t WriteEncrypted(const duckdb_apache::thrift::TBase &object, int8_t module, int16_t row_group_ordinal = -1,
+	                        int16_t column_ordinal = -1, int16_t page_ordinal = -1,
+	                        const string *key_override = nullptr);
+	uint32_t WriteDataEncrypted(const const_data_ptr_t buffer, const uint32_t buffer_size, int8_t module,
+	                            int16_t row_group_ordinal = -1, int16_t column_ordinal = -1,
+	                            int16_t page_ordinal = -1, const string *key_override = nullptr);
+
+	//! Accessors for PME file-level identifiers (empty strings in non-encrypted mode or legacy mode).
+	const string &GetAadFileUnique() const {
+		return aad_file_unique;
+	}
+	const string &GetAadPrefix() const {
+		return aad_prefix;
+	}
+	bool HasEncryption() const {
+		return encryption_config != nullptr;
+	}
+	//! Returns the raw AES key bytes to use for the given column path. If the column has a dedicated
+	//! column key, returns that key; otherwise returns the footer key. Caller must not keep the returned
+	//! reference past the lifetime of this ParquetWriter.
+	const string &GetColumnKey(const vector<string> &path_in_schema) const;
+	//! Returns true if this column path has a dedicated column key (i.e. encryption with column key).
+	bool HasColumnKey(const vector<string> &path_in_schema) const;
+	//! Returns the optional key_metadata to be stored in EncryptionWithColumnKey.key_metadata (may be empty).
+	const string &GetColumnKeyMetadata(const vector<string> &path_in_schema) const;
+	//! Joins a path_in_schema (vector) into the dot-separated form used by encryption_config.column_keys.
+	static string PathInSchemaToString(const vector<string> &path_in_schema);
 
 	GeoParquetFileMetadata &GetGeoParquetData();
 
@@ -211,6 +246,14 @@ private:
 	double bloom_filter_false_positive_ratio;
 	int64_t compression_level;
 	shared_ptr<EncryptionUtil> encryption_util;
+	//! PME file-level identifier (8 random bytes). Non-empty only when encryption is enabled.
+	string aad_file_unique;
+	//! Optional user-supplied AAD prefix (empty by default).
+	string aad_prefix;
+	//! If true, aad_prefix is NOT stored in FileCryptoMetaData; readers must supply it externally.
+	bool supply_aad_prefix = false;
+	//! If true, write the footer as plaintext + GCM tag (PAR1 magic). Reserved for future PR-3.
+	bool plaintext_footer = false;
 	ParquetVersion parquet_version;
 	GeoParquetVersion geoparquet_version;
 

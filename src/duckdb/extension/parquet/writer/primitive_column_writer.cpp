@@ -1,4 +1,5 @@
 #include "writer/primitive_column_writer.hpp"
+#include "parquet_crypto.hpp"
 #include "parquet_rle_bp_decoder.hpp"
 #include "parquet_rle_bp_encoder.hpp"
 #include "parquet_writer.hpp"
@@ -360,6 +361,16 @@ void PrimitiveColumnWriter::FinalizeWrite(ColumnWriterState &state_p) {
 
 	// write the individual pages to disk
 	idx_t total_uncompressed_size = 0;
+	const bool encrypted = writer.HasEncryption();
+	const int16_t row_group_ordinal = encrypted ? state.row_group.ordinal : int16_t(-1);
+	const int16_t column_ordinal =
+	    encrypted ? NumericCast<int16_t>(state.col_idx) : int16_t(-1);
+	// If this column has a dedicated column key, use it; otherwise fall back to the footer key.
+	const string *column_key_override =
+	    (encrypted && writer.HasColumnKey(column_chunk.meta_data.path_in_schema))
+	        ? &writer.GetColumnKey(column_chunk.meta_data.path_in_schema)
+	        : nullptr;
+	int16_t data_page_ordinal = 0; // per-column counter of DATA_PAGE / DATA_PAGE_V2
 	for (auto &write_info : state.write_info) {
 		// set the data page offset whenever we see the *first* data page
 		if (column_chunk.meta_data.data_page_offset == 0 && (write_info.page_header.type == PageType::DATA_PAGE ||
@@ -368,11 +379,52 @@ void PrimitiveColumnWriter::FinalizeWrite(ColumnWriterState &state_p) {
 		}
 		D_ASSERT(write_info.page_header.uncompressed_page_size > 0);
 		auto header_start_offset = column_writer.GetTotalWritten();
-		writer.Write(write_info.page_header);
-		// total uncompressed size in the column chunk includes the header size (!)
-		total_uncompressed_size += column_writer.GetTotalWritten() - header_start_offset;
-		total_uncompressed_size += write_info.page_header.uncompressed_page_size;
-		writer.WriteData(write_info.compressed_data, write_info.compressed_size);
+
+		if (encrypted) {
+			// Per PME spec, encrypt page header and page data separately with the right module.
+			int8_t header_module;
+			int8_t data_module;
+			int16_t header_page_ord = -1; // only data-page headers carry a page ordinal
+			int16_t data_page_ord = -1;
+			switch (write_info.page_header.type) {
+			case PageType::DICTIONARY_PAGE:
+				header_module = ParquetCrypto::DICTIONARY_PAGE_HEADER;
+				data_module = ParquetCrypto::DICTIONARY_PAGE;
+				break;
+			case PageType::DATA_PAGE:
+			case PageType::DATA_PAGE_V2:
+				header_module = ParquetCrypto::DATA_PAGE_HEADER;
+				data_module = ParquetCrypto::DATA_PAGE;
+				header_page_ord = data_page_ordinal;
+				data_page_ord = data_page_ordinal;
+				data_page_ordinal++;
+				break;
+			case PageType::INDEX_PAGE:
+				header_module = ParquetCrypto::COLUMN_INDEX;
+				data_module = ParquetCrypto::COLUMN_INDEX;
+				break;
+			default:
+				throw InternalException("Unknown PageType during encrypted write");
+			}
+			// PME requires PageHeader.compressed_page_size to equal the ON-DISK (ciphertext) size,
+			// i.e. plaintext_compressed + LEN(4) + NONCE(12) + TAG(16). Patch the header before writing.
+			const auto plaintext_compressed = write_info.compressed_size;
+			const uint32_t on_disk_size =
+			    UnsafeNumericCast<uint32_t>(plaintext_compressed) + ParquetCrypto::LENGTH_BYTES +
+			    ParquetCrypto::NONCE_BYTES + ParquetCrypto::TAG_BYTES;
+			write_info.page_header.compressed_page_size = UnsafeNumericCast<int32_t>(on_disk_size);
+			writer.WriteEncrypted(write_info.page_header, header_module, row_group_ordinal, column_ordinal,
+			                      header_page_ord, column_key_override);
+			total_uncompressed_size += column_writer.GetTotalWritten() - header_start_offset;
+			total_uncompressed_size += write_info.page_header.uncompressed_page_size;
+			writer.WriteDataEncrypted(write_info.compressed_data, write_info.compressed_size, data_module,
+			                          row_group_ordinal, column_ordinal, data_page_ord, column_key_override);
+		} else {
+			writer.Write(write_info.page_header);
+			total_uncompressed_size += column_writer.GetTotalWritten() - header_start_offset;
+			total_uncompressed_size += write_info.page_header.uncompressed_page_size;
+			writer.WriteData(write_info.compressed_data, write_info.compressed_size);
+		}
 	}
 	column_chunk.meta_data.total_compressed_size =
 	    UnsafeNumericCast<int64_t>(column_writer.GetTotalWritten() - start_offset);
