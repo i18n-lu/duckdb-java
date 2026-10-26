@@ -33,6 +33,14 @@ const string &ParquetKeys::GetKey(const string &key_name) const {
 	return keys.at(key_name);
 }
 
+void ParquetKeys::CopyKeysTo(unordered_map<string, string> &out) const {
+	out.clear();
+	out.reserve(keys.size());
+	for (const auto &kv : keys) {
+		out.emplace(kv.first, kv.second);
+	}
+}
+
 string ParquetKeys::ObjectType() {
 	return "parquet_keys";
 }
@@ -42,7 +50,7 @@ string ParquetKeys::GetObjectType() {
 }
 
 //===--------------------------------------------------------------------===//
-// ParquetKmsRegistry + default LocalWrapKmsClient
+// ParquetKmsRegistry + built-in LocalKmsClient (PyArrow-compatible, PKMT1)
 //===--------------------------------------------------------------------===//
 
 ParquetKmsRegistry &ParquetKmsRegistry::Get() {
@@ -70,60 +78,212 @@ shared_ptr<ParquetKmsClient> ParquetKmsRegistry::GetClient(const string &name) c
 }
 
 namespace {
-//! Default KmsClient used for round-trip tests. It wraps the DEK bytes with a master key byte buffer
-//! stored in the global ParquetKeys cache (same storage used by `PRAGMA add_parquet_key`). The
-//! wrapping format is a tiny JSON-ish ASCII string:
-//!     "LocalWrap|<master_key_id>|<base64(ciphertext_blob)>"
-//! The ciphertext blob is produced by XOR-ing DEK with a fixed-size derived key stream of the master
-//! key bytes (NOT a cryptographically strong KeyWrap! This is just test glue — real KMS integrations
-//! should implement their own KmsClient).
-class LocalWrapKmsClient : public ParquetKmsClient {
+//! Base64 helpers.
+static string ToBase64Str(const string &raw) {
+	if (raw.empty()) {
+		return "";
+	}
+	string encoded;
+	encoded.resize(Blob::ToBase64Size(string_t(raw)));
+	Blob::ToBase64(string_t(raw), &encoded[0]);
+	return encoded;
+}
+
+static string FromBase64Str(const string &b64) {
+	if (b64.empty()) {
+		return "";
+	}
+	string raw;
+	raw.resize(Blob::FromBase64Size(b64));
+	Blob::FromBase64(b64, reinterpret_cast<unsigned char *>(&raw[0]), raw.size());
+	return raw;
+}
+
+//! Extract a JSON string field from a flat PyArrow-style key_material JSON blob. This is a
+//! minimal, tolerant extractor sufficient for our well-known schema (no nested objects,
+//! simple quoted strings, no escape handling beyond \"). Throws if the field is missing.
+static string ExtractJsonStringField(const string &json, const string &field_name) {
+	// Look for  "field_name" : "<value>"
+	const string key_pat = "\"" + field_name + "\"";
+	auto key_pos = json.find(key_pat);
+	if (key_pos == string::npos) {
+		throw InvalidInputException("LocalKmsClient: key_material JSON missing field \"%s\"", field_name);
+	}
+	auto colon = json.find(':', key_pos + key_pat.size());
+	if (colon == string::npos) {
+		throw InvalidInputException("LocalKmsClient: malformed JSON near field \"%s\"", field_name);
+	}
+	auto open_quote = json.find('"', colon + 1);
+	if (open_quote == string::npos) {
+		throw InvalidInputException("LocalKmsClient: malformed JSON near field \"%s\"", field_name);
+	}
+	auto close_quote = json.find('"', open_quote + 1);
+	if (close_quote == string::npos) {
+		throw InvalidInputException("LocalKmsClient: malformed JSON near field \"%s\"", field_name);
+	}
+	return json.substr(open_quote + 1, close_quote - open_quote - 1);
+}
+
+//! Local (in-memory) KmsClient. Wraps DEKs with AES-GCM-256 under a master key held in-process,
+//! and emits the PyArrow-compatible `key_material` JSON blob so Parquet readers / writers that
+//! follow the PyArrow 17 KMS convention can round-trip with us. On-wire layout:
+//!     {"keyMaterialType":"PKMT1",
+//!      "internalStorage":true,
+//!      "doubleWrapping":false,
+//!      "kmsInstanceID":"<name>",
+//!      "kmsInstanceURL":"",
+//!      "masterKeyID":"<master_key_id>",
+//!      "wrappedDEK":"<base64(ciphertext||tag)>",
+//!      "iv":"<base64(iv)>"}
+//! Encryption uses AES-GCM-256 with a 12-byte random IV; the master key must be 16/24/32 bytes.
+class LocalKmsClient : public ParquetKmsClient {
 public:
-	explicit LocalWrapKmsClient(unordered_map<string, string> master_keys_p)
-	    : master_keys(std::move(master_keys_p)) {
+	LocalKmsClient(string instance_id_p, unordered_map<string, string> master_keys_p,
+	               shared_ptr<EncryptionUtil> encryption_util_p)
+	    : instance_id(std::move(instance_id_p)), master_keys(std::move(master_keys_p)),
+	      encryption_util(std::move(encryption_util_p)) {
 	}
 
 	string WrapKey(const string &dek, const string &master_key_id) override {
 		const auto &mk = ResolveMasterKey(master_key_id);
-		string wrapped(dek.size(), '\0');
-		for (idx_t i = 0; i < dek.size(); i++) {
-			wrapped[i] = dek[i] ^ mk[i % mk.size()];
-		}
-		string encoded;
-		encoded.resize(Blob::ToBase64Size(string_t(wrapped)));
-		Blob::ToBase64(string_t(wrapped), &encoded[0]);
-		return "LocalWrap|" + master_key_id + "|" + encoded;
+		// Build an AES-GCM-256 state.
+		auto meta = make_uniq<EncryptionStateMetadata>(EncryptionTypes::GCM, mk.size(),
+		                                               EncryptionTypes::EncryptionVersion::NONE);
+		auto aes = encryption_util->CreateEncryptionState(std::move(meta));
+		// 12-byte random IV.
+		EncryptionNonce nonce(EncryptionTypes::GCM, EncryptionTypes::EncryptionVersion::NONE);
+		nonce.SetSize(IV_BYTES);
+		aes->GenerateRandomData(nonce.data(), IV_BYTES);
+		string iv_bytes(reinterpret_cast<const char *>(nonce.data()), IV_BYTES);
+		aes->InitializeEncryption(nonce, reinterpret_cast<const_data_ptr_t>(mk.data()));
+		// Encrypt the DEK in-place.
+		string ciphertext(dek.size(), '\0');
+		aes->Process(reinterpret_cast<const_data_ptr_t>(dek.data()), dek.size(),
+		             reinterpret_cast<data_ptr_t>(&ciphertext[0]), ciphertext.size());
+		data_t tag[TAG_BYTES];
+		aes->Finalize(nullptr, 0, tag, TAG_BYTES);
+		// Append tag to ciphertext (PyArrow concatenates ct||tag inside wrappedDEK).
+		ciphertext.append(reinterpret_cast<const char *>(tag), TAG_BYTES);
+		return BuildKeyMaterialJson(master_key_id, ciphertext, iv_bytes);
 	}
 
 	string UnwrapKey(const string &key_metadata, const string &master_key_id) override {
-		const string prefix = "LocalWrap|" + master_key_id + "|";
-		if (key_metadata.size() < prefix.size() || key_metadata.compare(0, prefix.size(), prefix) != 0) {
-			throw InvalidInputException("LocalWrapKmsClient: unrecognized key_metadata format");
-		}
-		string b64 = key_metadata.substr(prefix.size());
-		string wrapped;
-		wrapped.resize(Blob::FromBase64Size(b64));
-		Blob::FromBase64(b64, reinterpret_cast<unsigned char *>(&wrapped[0]), wrapped.size());
 		const auto &mk = ResolveMasterKey(master_key_id);
-		string dek(wrapped.size(), '\0');
-		for (idx_t i = 0; i < wrapped.size(); i++) {
-			dek[i] = wrapped[i] ^ mk[i % mk.size()];
+		if (key_metadata.empty() || key_metadata[0] != '{') {
+			throw InvalidInputException(
+			    "LocalKmsClient: key_metadata is not a PyArrow-style JSON blob (keyMaterialType=PKMT1)");
 		}
+		// Validate the two fixed fields.
+		auto key_material_type = ExtractJsonStringField(key_metadata, "keyMaterialType");
+		if (key_material_type != "PKMT1") {
+			throw InvalidInputException(
+			    "LocalKmsClient: unsupported keyMaterialType '%s' (only 'PKMT1' is supported)",
+			    key_material_type);
+		}
+		auto wrapped_b64 = ExtractJsonStringField(key_metadata, "wrappedDEK");
+		auto iv_b64 = ExtractJsonStringField(key_metadata, "iv");
+		auto wrapped = FromBase64Str(wrapped_b64);
+		auto iv_bytes = FromBase64Str(iv_b64);
+		if (iv_bytes.size() != IV_BYTES) {
+			throw InvalidInputException("LocalKmsClient: expected %llu-byte IV, got %llu", (uint64_t)IV_BYTES,
+			                            (uint64_t)iv_bytes.size());
+		}
+		if (wrapped.size() < TAG_BYTES) {
+			throw InvalidInputException("LocalKmsClient: wrappedDEK too short to carry a GCM tag");
+		}
+		// Build an AES-GCM-256 state.
+		auto meta = make_uniq<EncryptionStateMetadata>(EncryptionTypes::GCM, mk.size(),
+		                                               EncryptionTypes::EncryptionVersion::NONE);
+		auto aes = encryption_util->CreateEncryptionState(std::move(meta));
+		EncryptionNonce nonce(EncryptionTypes::GCM, EncryptionTypes::EncryptionVersion::NONE);
+		nonce.SetSize(IV_BYTES);
+		memcpy(nonce.data(), iv_bytes.data(), IV_BYTES);
+		aes->InitializeDecryption(nonce, reinterpret_cast<const_data_ptr_t>(mk.data()));
+		const idx_t ct_len = wrapped.size() - TAG_BYTES;
+		string dek(ct_len, '\0');
+		aes->Process(reinterpret_cast<const_data_ptr_t>(wrapped.data()), ct_len,
+		             reinterpret_cast<data_ptr_t>(&dek[0]), dek.size());
+		// Verify tag; Finalize throws / returns tag-mismatch if the input tag is wrong.
+		data_t tag_buf[TAG_BYTES];
+		memcpy(tag_buf, wrapped.data() + ct_len, TAG_BYTES);
+		aes->Finalize(nullptr, 0, tag_buf, TAG_BYTES);
 		return dek;
 	}
 
 private:
+	static constexpr idx_t IV_BYTES = 12;
+	static constexpr idx_t TAG_BYTES = 16;
+
 	const string &ResolveMasterKey(const string &master_key_id) const {
 		auto it = master_keys.find(master_key_id);
 		if (it == master_keys.end()) {
-			throw InvalidInputException("LocalWrapKmsClient: master key id '%s' not configured", master_key_id);
+			throw InvalidInputException(
+			    "LocalKmsClient: master key id '%s' not configured. Register it with "
+			    "PRAGMA add_parquet_key(...) before PRAGMA register_local_kms(...).",
+			    master_key_id);
 		}
-		return it->second;
+		const auto &mk = it->second;
+		if (mk.size() != 16 && mk.size() != 24 && mk.size() != 32) {
+			throw InvalidInputException(
+			    "LocalKmsClient: master key '%s' has invalid length %llu (expected 16/24/32 bytes)",
+			    master_key_id, (uint64_t)mk.size());
+		}
+		return mk;
 	}
 
+	string BuildKeyMaterialJson(const string &master_key_id, const string &wrapped_ct_tag,
+	                            const string &iv_bytes) const {
+		// Minimal JSON writer; master_key_id and instance_id must not contain '"' / '\\'.
+		// Users feed these via PRAGMA/encryption_config, both of which are already VARCHAR.
+		return "{\"keyMaterialType\":\"PKMT1\","
+		       "\"internalStorage\":true,"
+		       "\"doubleWrapping\":false,"
+		       "\"kmsInstanceID\":\"" +
+		       instance_id +
+		       "\","
+		       "\"kmsInstanceURL\":\"\","
+		       "\"masterKeyID\":\"" +
+		       master_key_id +
+		       "\","
+		       "\"wrappedDEK\":\"" +
+		       ToBase64Str(wrapped_ct_tag) +
+		       "\","
+		       "\"iv\":\"" +
+		       ToBase64Str(iv_bytes) + "\"}";
+	}
+
+	string instance_id;
 	unordered_map<string, string> master_keys;
+	shared_ptr<EncryptionUtil> encryption_util;
 };
 } // namespace
+
+//===--------------------------------------------------------------------===//
+// PRAGMA register_local_kms: register an in-memory KMS instance that reuses the master-key
+// bytes previously registered via `PRAGMA add_parquet_key`. Signature:
+//     PRAGMA register_local_kms('<kms_name>');
+// A snapshot of the current session's parquet keys is captured as master keys for this KMS
+// instance. The KMS is registered in the global ParquetKmsRegistry under <kms_name> and can
+// then be referenced from `encryption_config.kms_client`.
+//===--------------------------------------------------------------------===//
+void ParquetCrypto::RegisterLocalKms(ClientContext &context, const FunctionParameters &parameters) {
+	const auto &kms_name = StringValue::Get(parameters.values[0]);
+	if (kms_name.empty()) {
+		throw InvalidInputException("register_local_kms: KMS name must not be empty");
+	}
+	// Snapshot the session's current ParquetKeys as master-key store.
+	auto &parquet_keys = ParquetKeys::Get(context);
+	unordered_map<string, string> master_keys;
+	parquet_keys.CopyKeysTo(master_keys);
+	if (master_keys.empty()) {
+		throw InvalidInputException(
+		    "register_local_kms: no parquet keys registered in this session. Call "
+		    "PRAGMA add_parquet_key('<master_key_id>','<key_bytes>') first.");
+	}
+	auto encryption_util = context.db->GetEncryptionUtil(false);
+	auto client = make_shared_ptr<LocalKmsClient>(kms_name, std::move(master_keys), std::move(encryption_util));
+	ParquetKmsRegistry::Get().Register(kms_name, std::move(client));
+}
 
 ParquetAdditionalAuthenticatedData::ParquetAdditionalAuthenticatedData(Allocator &allocator)
     : AdditionalAuthenticatedData(allocator) {

@@ -32,6 +32,9 @@ public:
 	void AddKey(const string &key_name, const string &key);
 	bool HasKey(const string &key_name) const;
 	const string &GetKey(const string &key_name) const;
+	//! Copy all registered (name -> key_bytes) pairs into `out`. Used by `PRAGMA register_local_kms`
+	//! to snapshot the session key pool as master keys for a LocalKmsClient instance.
+	void CopyKeysTo(unordered_map<string, string> &out) const;
 
 public:
 	static string ObjectType();
@@ -277,6 +280,10 @@ public:
 
 public:
 	static void AddKey(ClientContext &context, const FunctionParameters &parameters);
+	//! `PRAGMA register_local_kms('<kms_name>')` — register an in-memory KMS that reuses the
+	//! session's parquet-key pool as master keys. See parquet_crypto.cpp for the on-wire format
+	//! (PyArrow-compatible PKMT1 JSON blob).
+	static void RegisterLocalKms(ClientContext &context, const FunctionParameters &parameters);
 	static bool ValidKey(const std::string &key);
 
 public:

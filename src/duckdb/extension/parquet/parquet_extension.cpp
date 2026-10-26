@@ -914,6 +914,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                                  {LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(parquet_key_fun);
 
+	// register a local, in-memory KMS instance that reuses the session's parquet-key pool
+	// as master keys. The emitted key_metadata is PyArrow-compatible (keyMaterialType=PKMT1).
+	auto register_local_kms_fun = PragmaFunction::PragmaCall("register_local_kms", ParquetCrypto::RegisterLocalKms,
+	                                                         {LogicalType::VARCHAR});
+	loader.RegisterFunction(register_local_kms_fun);
+
 	auto &config = DBConfig::GetConfig(db_instance);
 	config.replacement_scans.emplace_back(ParquetScanReplacement);
 	config.AddExtensionOption("binary_as_string", "In Parquet files, interpret binary data as a string.",
