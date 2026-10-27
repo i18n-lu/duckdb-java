@@ -493,7 +493,7 @@ ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, string file
 			if (!footer_master.empty()) {
 				string footer_dek(32, '\0');
 				rnd_state2->GenerateRandomData(reinterpret_cast<data_ptr_t>(&footer_dek[0]), 32);
-				auto wrapped = kms->WrapKey(footer_dek, footer_master);
+				auto wrapped = kms->WrapKey(footer_dek, footer_master, /*is_footer_key=*/true);
 				encryption_config->SetFooterKeyBytes(std::move(footer_dek));
 				encryption_config->SetFooterKeyMetadata(std::move(wrapped));
 			}
@@ -518,7 +518,7 @@ ParquetWriter::ParquetWriter(ClientContext &context, FileSystem &fs, string file
 			for (auto &pm : snapshot) {
 				string dek(32, '\0');
 				rnd_state2->GenerateRandomData(reinterpret_cast<data_ptr_t>(&dek[0]), 32);
-				auto wrapped = kms->WrapKey(dek, pm.second);
+				auto wrapped = kms->WrapKey(dek, pm.second, /*is_footer_key=*/false);
 				encryption_config->SetColumnKeyBytes(pm.first, std::move(dek));
 				encryption_config->SetColumnKeyMetadata(pm.first, std::move(wrapped));
 			}

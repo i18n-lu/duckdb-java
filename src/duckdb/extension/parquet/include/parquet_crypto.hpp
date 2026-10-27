@@ -56,11 +56,15 @@ class ParquetKmsClient {
 public:
 	virtual ~ParquetKmsClient() = default;
 	//! Wrap `dek` (data encryption key, raw bytes) with the master key identified by `master_key_id`.
+	//! `is_footer_key` tells implementations whether the DEK being wrapped is for the footer or a column
+	//! (required to emit a PyArrow-compatible KeyMaterial, which has an `isFooterKey` field and different
+	//! sets of fields for footer vs. column KeyMaterial).
 	//! Returns the wrapped key metadata bytes which will be stored in the Parquet file.
-	virtual string WrapKey(const string &dek, const string &master_key_id) = 0;
+	virtual string WrapKey(const string &dek, const string &master_key_id, bool is_footer_key) = 0;
 	//! Unwrap `key_metadata` (produced by WrapKey) using the master key identified by `master_key_id`.
+	//! `is_footer_key` indicates whether the key_metadata being unwrapped is for the footer or a column.
 	//! Returns the plaintext DEK bytes.
-	virtual string UnwrapKey(const string &key_metadata, const string &master_key_id) = 0;
+	virtual string UnwrapKey(const string &key_metadata, const string &master_key_id, bool is_footer_key) = 0;
 };
 
 //! Global registry of KmsClient instances. Extensions register implementations by name; the

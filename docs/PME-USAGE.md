@@ -241,19 +241,41 @@ SELECT count(*) FROM read_parquet('kms.parquet',
 
 **on-wire 格式**（存入 Parquet 的 `key_metadata` 字段）：
 
+Footer（FileCryptoMetaData.key_metadata）：
+
 ```json
 {"keyMaterialType":"PKMT1",
- "internalStorage":true,
- "doubleWrapping":false,
+ "isFooterKey":true,
  "kmsInstanceID":"local",
  "kmsInstanceURL":"",
+ "internalStorage":true,
+ "doubleWrapping":false,
  "masterKeyID":"mk_footer",
- "wrappedDEK":"<base64(AES-GCM-256(ct||tag))>",
- "iv":"<base64(12-byte-iv)>"}
+ "wrappedDEK":"<base64(IV(12) || CT || TAG(16))>"}
 ```
+
+Column（EncryptionWithColumnKey.key_metadata，比 footer 瘦）：
+
+```json
+{"keyMaterialType":"PKMT1",
+ "isFooterKey":false,
+ "masterKeyID":"mk_col_a",
+ "wrappedDEK":"<base64(IV(12) || CT || TAG(16))>"}
+```
+
+字段说明（严格对齐 Apache Arrow `parquet/encryption/key_material.h` 的 PyArrow 17 规范）：
+
+- **`isFooterKey`**：所有 KeyMaterial 必需；指示本条 KeyMaterial 保护的是 footer DEK 还是某个 column DEK。
+- **`kmsInstanceID` / `kmsInstanceURL` / `internalStorage` / `doubleWrapping`**：**仅 footer** KeyMaterial 携带（PyArrow 规定 column KeyMaterial 不写这些字段）。
+- **`masterKeyID` / `wrappedDEK`**：当 `doubleWrapping=false`（本实现始终如此）时存在。
+- **IV 不再是独立 JSON 字段**：按 Apache Arrow `KeyToolkit::encryptKeyLocally` 的字节布局，12 字节 IV 直接前置到 `wrappedDEK`（即 `base64(IV || CT || TAG)`），与 PyArrow 17 wire-level 完全一致。
 
 > 该格式与 PyArrow 17 的 `KmsClient.wrap_key(...)` 内部产物完全一致 ——
 > 这意味着 **DuckDB(本工程) ↔ PyArrow 17 KMS 文件可以双向 round-trip**，只要双方用同一组 master keys。
+>
+> ⚠️ **破坏性变更（相较于本工程早期 PR-4 预览版）**：早期预览版把 IV 存成独立的 `"iv"` JSON 字段。
+> 当前版本已切到 PyArrow 对齐布局并**不再兼容**旧文件 —— 若 UnwrapKey 发现 `key_metadata` 里含 `"iv"` 字段，
+> 会抛清晰的报错，要求用新版本重新加密生成文件。
 
 **注意事项**：
 - `register_local_kms` **只拍一次快照**：之后再 `add_parquet_key` 新注册的密钥**不会**自动进入该 KMS 实例的 master-key 池，需要重新 `register_local_kms('local')` 覆盖同名实例。
@@ -309,12 +331,16 @@ class MyLocalKmsClient(pe.KmsClient):
 
 class MyKmsClient : public duckdb::ParquetKmsClient {
 public:
-    std::string WrapKey(const std::string &dek, const std::string &master_key_id) override {
-        // 调用你的 KMS，用 master_key_id 对应的 MK 加密 dek，返回不透明 blob
-        return my_kms_wrap(dek, master_key_id);
+    std::string WrapKey(const std::string &dek, const std::string &master_key_id,
+                        bool is_footer_key) override {
+        // 调用你的 KMS，用 master_key_id 对应的 MK 加密 dek，返回不透明 blob。
+        // `is_footer_key` 用于在产出的 key_metadata 中标记这是 footer DEK 还是 column DEK
+        // （若你要与 PyArrow 17 wire-level 兼容，必须把它映射为 KeyMaterial.isFooterKey）。
+        return my_kms_wrap(dek, master_key_id, is_footer_key);
     }
-    std::string UnwrapKey(const std::string &key_metadata, const std::string &master_key_id) override {
-        return my_kms_unwrap(key_metadata, master_key_id);
+    std::string UnwrapKey(const std::string &key_metadata, const std::string &master_key_id,
+                          bool is_footer_key) override {
+        return my_kms_unwrap(key_metadata, master_key_id, is_footer_key);
     }
 };
 
@@ -324,6 +350,10 @@ duckdb::ParquetKmsRegistry::Get().Register(
     std::make_shared<MyKmsClient>()
 );
 ```
+
+> ⚠️ **接口 ABI 变更**：`WrapKey/UnwrapKey` 在当前版本新增 `bool is_footer_key` 参数（为对齐
+> PyArrow 17 KeyMaterial 的 `isFooterKey` 字段）。如果你此前基于旧签名实现过 KmsClient，升级时
+> 必须同步修改方法签名，否则无法通过 override 编译检查。
 
 > 自定义 KmsClient 的 `key_metadata` 格式**不要求**与 PyArrow 兼容；只要你的 Wrap/Unwrap 自洽即可。
 > 如果希望产出的文件也能被 PyArrow 17 读取，请 emit 相同的 PKMT1 JSON 格式（见 §4.2 的
@@ -399,6 +429,7 @@ try (var conn = DriverManager.getConnection("jdbc:duckdb:");
 | `LocalKmsClient: master key id 'X' not configured` | 用了未注册的 `master_key_id` | `PRAGMA add_parquet_key(...)` 补齐后 **重新** `register_local_kms(...)`（快照是一次性的） |
 | `LocalKmsClient: master key 'X' has invalid length` | master key 字节数非 16/24/32 | 换成合法的 AES-128/192/256 bytes |
 | `LocalKmsClient: unsupported keyMaterialType ...` | 文件 `key_metadata` 不是 PKMT1 JSON（例如旧版 LocalWrap 或外部 KMS） | 用匹配该格式的 KmsClient 读取 |
+| `LocalKmsClient: this file uses the deprecated DuckDB-local wire-format ...` | 文件是**本工程早期 PR-4 预览版**写出的，带独立 `"iv"` JSON 字段 | 用当前版本重新读源数据并再加密生成文件（当前版本 IV 已内嵌到 `wrappedDEK`，与 PyArrow 17 对齐） |
 | `AES_GCM_CTR_V1 ... not supported` | 文件用非 PME-GCM 加密 | 升级生产侧写入到 AES_GCM_V1 |
 | `plaintext_footer ... not implemented` | 用了 `plaintext_footer: true` | 当前不支持，去掉该参数 |
 | JDBC 下 PME 行为与 CLI 不一致 | `libduckdb_java.so` 没替换 vendored duckdb | 参照 `scripts/pme-linux-build/README.md` 重新构建 JDBC |

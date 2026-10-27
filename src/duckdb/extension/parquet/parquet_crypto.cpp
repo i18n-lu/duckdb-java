@@ -127,15 +127,23 @@ static string ExtractJsonStringField(const string &json, const string &field_nam
 //! Local (in-memory) KmsClient. Wraps DEKs with AES-GCM-256 under a master key held in-process,
 //! and emits the PyArrow-compatible `key_material` JSON blob so Parquet readers / writers that
 //! follow the PyArrow 17 KMS convention can round-trip with us. On-wire layout:
+//! Footer KeyMaterial:
 //!     {"keyMaterialType":"PKMT1",
-//!      "internalStorage":true,
-//!      "doubleWrapping":false,
+//!      "isFooterKey":true,
 //!      "kmsInstanceID":"<name>",
 //!      "kmsInstanceURL":"",
+//!      "internalStorage":true,
+//!      "doubleWrapping":false,
 //!      "masterKeyID":"<master_key_id>",
-//!      "wrappedDEK":"<base64(ciphertext||tag)>",
-//!      "iv":"<base64(iv)>"}
+//!      "wrappedDEK":"<base64(iv(12) || ciphertext || tag(16))>"}
+//! Column KeyMaterial (slimmer, matches PyArrow 17):
+//!     {"keyMaterialType":"PKMT1",
+//!      "isFooterKey":false,
+//!      "masterKeyID":"<master_key_id>",
+//!      "wrappedDEK":"<base64(iv(12) || ciphertext || tag(16))>"}
 //! Encryption uses AES-GCM-256 with a 12-byte random IV; the master key must be 16/24/32 bytes.
+//! The IV is NOT a separate JSON field; it is prepended to the ciphertext inside `wrappedDEK`, exactly
+//! as Apache Arrow / PyArrow's KeyToolkit::encryptKeyLocally emits it, so files are wire-level compatible.
 class LocalKmsClient : public ParquetKmsClient {
 public:
 	LocalKmsClient(string instance_id_p, unordered_map<string, string> master_keys_p,
@@ -144,7 +152,7 @@ public:
 	      encryption_util(std::move(encryption_util_p)) {
 	}
 
-	string WrapKey(const string &dek, const string &master_key_id) override {
+	string WrapKey(const string &dek, const string &master_key_id, bool is_footer_key) override {
 		const auto &mk = ResolveMasterKey(master_key_id);
 		// Build an AES-GCM-256 state.
 		auto meta = make_uniq<EncryptionStateMetadata>(EncryptionTypes::GCM, mk.size(),
@@ -162,35 +170,52 @@ public:
 		             reinterpret_cast<data_ptr_t>(&ciphertext[0]), ciphertext.size());
 		data_t tag[TAG_BYTES];
 		aes->Finalize(nullptr, 0, tag, TAG_BYTES);
-		// Append tag to ciphertext (PyArrow concatenates ct||tag inside wrappedDEK).
-		ciphertext.append(reinterpret_cast<const char *>(tag), TAG_BYTES);
-		return BuildKeyMaterialJson(master_key_id, ciphertext, iv_bytes);
+		// PyArrow (Apache Arrow KeyToolkit::encryptKeyLocally) packs the wrapped DEK as
+		//     base64( IV(12) || CT || TAG(16) )
+		// into a single JSON field `wrappedDEK`. There is NO separate `iv` field.
+		string iv_ct_tag;
+		iv_ct_tag.reserve(iv_bytes.size() + ciphertext.size() + TAG_BYTES);
+		iv_ct_tag.append(iv_bytes);
+		iv_ct_tag.append(ciphertext);
+		iv_ct_tag.append(reinterpret_cast<const char *>(tag), TAG_BYTES);
+		return BuildKeyMaterialJson(master_key_id, iv_ct_tag, is_footer_key);
 	}
 
-	string UnwrapKey(const string &key_metadata, const string &master_key_id) override {
+	string UnwrapKey(const string &key_metadata, const string &master_key_id, bool is_footer_key) override {
+		(void)is_footer_key; // Not needed for local unwrap; carried through the interface for
+		                     // implementations that must behave differently for footer vs. column
+		                     // (e.g. verify `isFooterKey` matches, or query a different KMS endpoint).
 		const auto &mk = ResolveMasterKey(master_key_id);
 		if (key_metadata.empty() || key_metadata[0] != '{') {
 			throw InvalidInputException(
 			    "LocalKmsClient: key_metadata is not a PyArrow-style JSON blob (keyMaterialType=PKMT1)");
 		}
-		// Validate the two fixed fields.
 		auto key_material_type = ExtractJsonStringField(key_metadata, "keyMaterialType");
 		if (key_material_type != "PKMT1") {
 			throw InvalidInputException(
 			    "LocalKmsClient: unsupported keyMaterialType '%s' (only 'PKMT1' is supported)",
 			    key_material_type);
 		}
+		// Reject the deprecated DuckDB-pre-interop wire-format that stored IV in a separate JSON
+		// field (we are now PyArrow 17 wire-level compatible: IV is embedded as the first 12 bytes
+		// of wrappedDEK). Files produced by older builds of this extension must be re-encrypted.
+		if (key_metadata.find("\"iv\"") != string::npos) {
+			throw InvalidInputException(
+			    "LocalKmsClient: this file uses the deprecated DuckDB-local wire-format with a "
+			    "separate 'iv' JSON field. Re-encrypt it with a current build (IV is now embedded "
+			    "inside 'wrappedDEK' for PyArrow 17 compatibility).");
+		}
 		auto wrapped_b64 = ExtractJsonStringField(key_metadata, "wrappedDEK");
-		auto iv_b64 = ExtractJsonStringField(key_metadata, "iv");
 		auto wrapped = FromBase64Str(wrapped_b64);
-		auto iv_bytes = FromBase64Str(iv_b64);
-		if (iv_bytes.size() != IV_BYTES) {
-			throw InvalidInputException("LocalKmsClient: expected %llu-byte IV, got %llu", (uint64_t)IV_BYTES,
-			                            (uint64_t)iv_bytes.size());
+		// PyArrow layout: IV(12) || CT(N) || TAG(16); minimum N==dek_len==0 is nonsensical,
+		// but we only require IV+TAG to be present and CT to be non-empty.
+		if (wrapped.size() < IV_BYTES + TAG_BYTES + 1) {
+			throw InvalidInputException(
+			    "LocalKmsClient: wrappedDEK too short (expected at least %llu bytes: IV(12)+CT+TAG(16))",
+			    (uint64_t)(IV_BYTES + TAG_BYTES + 1));
 		}
-		if (wrapped.size() < TAG_BYTES) {
-			throw InvalidInputException("LocalKmsClient: wrappedDEK too short to carry a GCM tag");
-		}
+		string iv_bytes(wrapped.data(), IV_BYTES);
+		const idx_t ct_len = wrapped.size() - IV_BYTES - TAG_BYTES;
 		// Build an AES-GCM-256 state.
 		auto meta = make_uniq<EncryptionStateMetadata>(EncryptionTypes::GCM, mk.size(),
 		                                               EncryptionTypes::EncryptionVersion::NONE);
@@ -199,13 +224,12 @@ public:
 		nonce.SetSize(IV_BYTES);
 		memcpy(nonce.data(), iv_bytes.data(), IV_BYTES);
 		aes->InitializeDecryption(nonce, reinterpret_cast<const_data_ptr_t>(mk.data()));
-		const idx_t ct_len = wrapped.size() - TAG_BYTES;
 		string dek(ct_len, '\0');
-		aes->Process(reinterpret_cast<const_data_ptr_t>(wrapped.data()), ct_len,
+		aes->Process(reinterpret_cast<const_data_ptr_t>(wrapped.data()) + IV_BYTES, ct_len,
 		             reinterpret_cast<data_ptr_t>(&dek[0]), dek.size());
 		// Verify tag; Finalize throws / returns tag-mismatch if the input tag is wrong.
 		data_t tag_buf[TAG_BYTES];
-		memcpy(tag_buf, wrapped.data() + ct_len, TAG_BYTES);
+		memcpy(tag_buf, wrapped.data() + IV_BYTES + ct_len, TAG_BYTES);
 		aes->Finalize(nullptr, 0, tag_buf, TAG_BYTES);
 		return dek;
 	}
@@ -231,25 +255,29 @@ private:
 		return mk;
 	}
 
-	string BuildKeyMaterialJson(const string &master_key_id, const string &wrapped_ct_tag,
-	                            const string &iv_bytes) const {
+	string BuildKeyMaterialJson(const string &master_key_id, const string &iv_ct_tag,
+	                            bool is_footer_key) const {
+		// PyArrow 17 KeyMaterial layout (Apache Arrow: parquet/encryption/key_material.h):
+		//   - keyMaterialType: always "PKMT1"
+		//   - isFooterKey: always present
+		//   - kmsInstanceID / kmsInstanceURL / internalStorage / doubleWrapping: footer-only
+		//   - masterKeyID / wrappedDEK: present when doubleWrapping=false (our case)
+		// Column KeyMaterial therefore only carries {keyMaterialType, isFooterKey, masterKeyID, wrappedDEK}.
 		// Minimal JSON writer; master_key_id and instance_id must not contain '"' / '\\'.
 		// Users feed these via PRAGMA/encryption_config, both of which are already VARCHAR.
-		return "{\"keyMaterialType\":\"PKMT1\","
-		       "\"internalStorage\":true,"
-		       "\"doubleWrapping\":false,"
-		       "\"kmsInstanceID\":\"" +
-		       instance_id +
-		       "\","
-		       "\"kmsInstanceURL\":\"\","
-		       "\"masterKeyID\":\"" +
-		       master_key_id +
-		       "\","
-		       "\"wrappedDEK\":\"" +
-		       ToBase64Str(wrapped_ct_tag) +
-		       "\","
-		       "\"iv\":\"" +
-		       ToBase64Str(iv_bytes) + "\"}";
+		string out = "{\"keyMaterialType\":\"PKMT1\",\"isFooterKey\":";
+		out += (is_footer_key ? "true" : "false");
+		if (is_footer_key) {
+			out += ",\"kmsInstanceID\":\"";
+			out += instance_id;
+			out += "\",\"kmsInstanceURL\":\"\",\"internalStorage\":true,\"doubleWrapping\":false";
+		}
+		out += ",\"masterKeyID\":\"";
+		out += master_key_id;
+		out += "\",\"wrappedDEK\":\"";
+		out += ToBase64Str(iv_ct_tag);
+		out += "\"}";
+		return out;
 	}
 
 	string instance_id;

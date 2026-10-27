@@ -217,7 +217,8 @@ LoadMetadata(ClientContext &context, Allocator &allocator, CachingFileHandle &fi
 					    "provided",
 					    file_handle.GetPath());
 				}
-				auto footer_dek = kms->UnwrapKey(crypto_metadata->key_metadata, footer_master);
+				auto footer_dek =
+				    kms->UnwrapKey(crypto_metadata->key_metadata, footer_master, /*is_footer_key=*/true);
 				const_cast<ParquetEncryptionConfig &>(*encryption_config).SetFooterKeyBytes(std::move(footer_dek));
 			}
 		}
@@ -263,7 +264,7 @@ LoadMetadata(ClientContext &context, Allocator &allocator, CachingFileHandle &fi
 						    "entry was configured",
 						    file_handle.GetPath(), dot);
 					}
-					auto col_dek = kms2->UnwrapKey(ewck.key_metadata, col_master);
+					auto col_dek = kms2->UnwrapKey(ewck.key_metadata, col_master, /*is_footer_key=*/false);
 					const_cast<ParquetEncryptionConfig &>(*encryption_config)
 					    .SetColumnKeyBytes(dot, std::move(col_dek));
 				}
