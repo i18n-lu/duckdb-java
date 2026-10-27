@@ -265,13 +265,24 @@ private:
 		// Column KeyMaterial therefore only carries {keyMaterialType, isFooterKey, masterKeyID, wrappedDEK}.
 		// Minimal JSON writer; master_key_id and instance_id must not contain '"' / '\\'.
 		// Users feed these via PRAGMA/encryption_config, both of which are already VARCHAR.
+		// NOTE on PyArrow 17 reader compatibility:
+		//   The upstream Apache Arrow key_material.h spec says `internalStorage` / `doubleWrapping` /
+		//   `kmsInstanceID` / `kmsInstanceURL` are *footer-only* fields. However, the PyArrow 17
+		//   C++ reader actually requires `internalStorage` and `doubleWrapping` to be present in
+		//   *every* KeyMaterial (both footer and column) — otherwise it throws
+		//   `ArrowKeyError: Key 'internalStorage' does not exist` while unwrapping column DEKs.
+		//   To stay interoperable with PyArrow 17 (writer→reader round-trip), we emit the two
+		//   boolean fields unconditionally. `kmsInstanceID` / `kmsInstanceURL` remain footer-only
+		//   because PyArrow readers do not require them on columns and keeping them off reduces
+		//   the serialized size for column-heavy files.
 		string out = "{\"keyMaterialType\":\"PKMT1\",\"isFooterKey\":";
 		out += (is_footer_key ? "true" : "false");
 		if (is_footer_key) {
 			out += ",\"kmsInstanceID\":\"";
 			out += instance_id;
-			out += "\",\"kmsInstanceURL\":\"\",\"internalStorage\":true,\"doubleWrapping\":false";
+			out += "\",\"kmsInstanceURL\":\"\"";
 		}
+		out += ",\"internalStorage\":true,\"doubleWrapping\":false";
 		out += ",\"masterKeyID\":\"";
 		out += master_key_id;
 		out += "\",\"wrappedDEK\":\"";
