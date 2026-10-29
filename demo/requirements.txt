@@ -1,0 +1,17 @@
+# demo 目录下 Python 样例的依赖
+# 用法（推荐在 demo/.venv 虚拟环境中安装）：
+#   python3 -m venv .venv
+#   ./.venv/bin/pip install -r requirements.txt
+#
+# 版本说明：
+# - 以当前跑通的版本为下限，用 >= 允许小版本升级；
+#   如果需要完全可复现，可改成 == 锁死。
+# - cffi / pycparser 由 cryptography 作为传递依赖自动安装，
+#   无需在此声明。
+# - 下限选取规则：取当前支持的最低 Python 版本（3.8）下仍能装到的版本，
+#   以保证 3.8 / 3.13 环境都能一键安装通过。
+#   Python 3.8 已 EOL，若后续放弃 3.8，可同步上调下限到更高版本。
+
+numpy>=1.23.3
+pyarrow>=17.0.0
+cryptography>=41.0.7
