@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------------
+# demo/bin/java — JDK 1.8 兼容包装
+#
+# 入口脚本 (A/B/C/D) 用 subprocess.run(["java", "--class-path", <jar>,
+# <FooBar.java>, <args>...]) 调用 Java，该语法仅 JDK 11+ 支持。本 wrapper 做：
+#   1. 把 --class-path 翻译成 -cp，并把本目录 ../classes 也挂进 classpath；
+#   2. 将 FooBar.java 翻译成类名 FooBar（已被 javac 预编译到 ../classes）；
+#   3. 转发给真实的 JDK 1.8 的 java 二进制。
+# ----------------------------------------------------------------------------
+set -euo pipefail
+
+DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CLASSES_DIR="$DEMO_DIR/classes"
+
+: "${REAL_JAVA:=/Library/Java/JavaVirtualMachines/jdk1.8.0_462.jdk/Contents/Home/bin/java}"
+
+CP=""
+NEW_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --class-path|--classpath|-cp|-classpath)
+            CP="$2"
+            shift 2
+            ;;
+        *.java)
+            # 把 /path/to/FooBar.java 转成类名 FooBar
+            base="$(basename "$1")"
+            NEW_ARGS+=("${base%.java}")
+            shift
+            ;;
+        *)
+            NEW_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# 把本目录预编译 class 目录和原 --class-path 一起作为 -cp
+FULL_CP="$CLASSES_DIR"
+if [[ -n "$CP" ]]; then
+    FULL_CP="$CLASSES_DIR:$CP"
+fi
+
+exec "$REAL_JAVA" -cp "$FULL_CP" "${NEW_ARGS[@]}"
