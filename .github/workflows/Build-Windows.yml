@@ -1,0 +1,100 @@
+name: Build Windows DLL
+
+# 手动触发（Actions 页面点 Run workflow），也可按需调度
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: false
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build-windows-amd64:
+    name: Windows (amd64)
+    runs-on: windows-latest
+    env:
+      BUILD_TYPE: ${{ inputs.build_type || 'Release' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Show environment
+        shell: bash
+        run: |
+          echo "===== OS ====="
+          uname -a || true
+          echo "===== Java ====="
+          java -version
+          javac -version
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "===== CMake ====="
+          cmake --version
+
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v4
+
+      - name: Configure
+        shell: cmd
+        run: |
+          mkdir build\release
+          cd build\release
+          cmake ..\.. -G Ninja -DCMAKE_BUILD_TYPE=%BUILD_TYPE%
+
+      - name: Build
+        shell: cmd
+        run: |
+          cd build\release
+          cmake --build . --config %BUILD_TYPE%
+
+      - name: Verify artifacts
+        shell: cmd
+        run: |
+          echo ===== build\release 下的产物 =====
+          dir build\release
+          echo ===== so 文件(实际为 DLL) 信息 =====
+          dumpbin.exe /headers build\release\libduckdb_java.so_windows_amd64 | findstr /C:"machine"
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist/jdbc
+          cp build/release/libduckdb_java.so_windows_amd64 dist/jdbc/
+          cp build/release/duckdb_jdbc.jar               dist/jdbc/ || true
+          cp build/release/duckdb_jdbc_tests.jar         dist/jdbc/ || true
+          echo "===== 最终产物 ====="
+          ls -lh dist/jdbc/
+
+      - name: Upload artifact (so only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libduckdb_java-windows-amd64-so
+          path: dist/jdbc/libduckdb_java.so_windows_amd64
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload artifact (full)
+        uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-java-windows-amd64-full
+          path: dist/jdbc/*
+          if-no-files-found: error
+          retention-days: 14
