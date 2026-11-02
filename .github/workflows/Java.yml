@@ -1,7 +1,7 @@
 name: Java JDBC
+
+# 仅手动触发，避免每次 push/PR 都消耗 Actions 额度
 on:
-  push:
-  pull_request:
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -9,10 +9,6 @@ on:
         required: false
         default: 'false'
         type: 'string'
-env:
-  AWS_ENDPOINT_URL: ${{ secrets.S3_DUCKDB_STAGING_ENDPOINT }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.S3_DUCKDB_STAGING_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_DUCKDB_STAGING_KEY }}
 
 jobs:
 
@@ -66,7 +62,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
+          key: ${{ steps.cache_key.outputs.value }}
 
       - name: List Symbols
         run: |
@@ -88,602 +84,61 @@ jobs:
         if: ${{ inputs.skip_tests != 'true' }}
         uses: ./.github/composite-actions/linux-tests-host
 
-      - name: Deploy
+      - name: Collect artifacts
         shell: bash
         run: |
-          cp build/release/duckdb_jdbc.jar duckdb_jdbc-linux-amd64.jar
-          ./scripts/upload-assets-to-staging.sh github_release duckdb_jdbc-linux-amd64.jar
+          mkdir -p dist/jdbc
+          cp build/release/libduckdb_java.so_linux_amd64 dist/jdbc/
+          cp build/release/duckdb_jdbc.jar               dist/jdbc/ || true
+          cp build/release/duckdb_jdbc_tests.jar         dist/jdbc/ || true
+          echo "===== dist/jdbc 产物 ====="
+          ls -lh dist/jdbc/
 
       - uses: actions/upload-artifact@v4
         with:
           name: java-linux-amd64
-          path: |
-            build/release/duckdb_jdbc.jar
-
-  java-linux-amd64-tck:
-    name: Linux TCK (amd64)
-    runs-on: ubuntu-latest
-    needs: java-linux-amd64
-    env:
-      MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cache Key
-        id: cache_key
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: ./.github/composite-actions/linux-build-docker
-        with:
-          docker_image: '${{ env.MANYLINUX_IMAGE }}'
-
-      - name: Checkout Platform TCK
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: actions/checkout@v4
-        with:
-          repository: jakartaee/platform-tck
-          ref: 10.0.6
-          path: platform-tck
-
-      - name: Checkout CTS Runner 
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: actions/checkout@v4
-        with:
-          repository: duckdb/jdbc_compatibility_test_suite_runner
-          path: jdbc_compatibility_test_suite_runner
-
-      - name: CTS tests
-        if: ${{ inputs.skip_tests != 'true' }}
-        run: |
-          docker run                                           \
-          -v.:/duckdb                                          \
-          -e JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk         \
-          -e DUCKDB_JAR=/duckdb/build/release/duckdb_jdbc.jar  \
-          -e PLATFORM_TCK_DIR=/duckdb/platform-tck             \
-          ${{ env.MANYLINUX_IMAGE }}                           \
-          bash -c "
-            set -e
-            cat /etc/os-release
-            dnf install -y \
-              java-1.8.0-openjdk-devel
-            make -C /duckdb/jdbc_compatibility_test_suite_runner test
-          "
-
-  java-linux-amd64-spark:
-    name: Linux Spark (amd64)
-    runs-on: ubuntu-latest
-    needs: java-linux-amd64
-    env:
-      MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-      DUCKDB_JDBC_JAR: ${{ github.workspace }}/build/release/duckdb_jdbc.jar
-      SPARK_SQL_EXE: ${{ github.workspace }}/sparktest/spark-3.5.3-bin-hadoop3/bin/spark-sql
-      POSTGRES_HOST: 127.0.0.1
-      POSTGRES_PORT: 5432
-      POSTGRES_MAINTENANCE_DB: postgres
-      POSTGRES_USERNAME: postgres
-      POSTGRES_PASSWORD: postgres
-      DUCKLAKE_CATALOG_DB: lake_test
-      PARQUET_FILE_URL: https://blobs.duckdb.org/data/taxi_2019_04.parquet
-      SESSION_INIT_SQL_FILE: ${{ github.workspace }}/sparktest/spark-session-init.sql
-      MINIO_EXE: ${{ github.workspace }}/sparktest/minio
-      MINIO_PID: ${{ github.workspace }}/sparktest/minio.pid
-      MC_EXE: ${{ github.workspace }}/sparktest/mc
-      MINIO_DATA: ${{ github.workspace }}/sparktest/minio_data
-      MINIO_HOST: 127.0.0.1
-      MINIO_PORT: 9000
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cache Key
-        id: cache_key
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: ./.github/composite-actions/linux-build-docker
-        with:
-          docker_image: '${{ env.MANYLINUX_IMAGE }}'
-
-      - name: Spark Test Resources
-        if: ${{ inputs.skip_tests != 'true' }}
-        run: |
-          mkdir sparktest
-          cd sparktest
-          cmake ..
-
-      - name: Setup Postgres
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: ikalnytskyi/action-setup-postgres@v7
-        with:
-          postgres-version: '17'
-          username: ${{ env.POSTGRES_USERNAME }}
-          password: ${{ env.POSTGRES_PASSWORD }}
-          database: ${{ env.POSTGRES_MAINTENANCE_DB }}
-          port: ${{ env.POSTGRES_PORT }}
-          ssl: true
-
-      - name: Setup Minio
-        if: ${{ inputs.skip_tests != 'true' }}
-        working-directory: sparktest
-        run: |
-          wget -nv https://dl.min.io/server/minio/release/linux-amd64/minio
-          chmod +x minio
-          ./minio --version
-          wget -nv https://dl.min.io/client/mc/release/linux-amd64/mc
-          chmod +x mc
-          ./mc --version
-          java -version
-          java ${{ github.workspace }}/src/test/external/SetupMinio.java
-
-      - name: Setup DuckLake
-        if: ${{ inputs.skip_tests != 'true' }}
-        working-directory: sparktest
-        run: |
-          cat ${{ env.SESSION_INIT_SQL_FILE }}
-          wget -nv https://github.com/pgjdbc/pgjdbc/releases/download/REL42.7.7/postgresql-42.7.7.jar
-          java -version
-          java -cp ${{ env.DUCKDB_JDBC_JAR }}:postgresql-42.7.7.jar ${{ github.workspace }}/src/test/external/SetupDuckLake.java
-
-      - name: Spark Tests
-        if: ${{ inputs.skip_tests != 'true' }}
-        working-directory: sparktest
-        run: |
-          wget -nv https://blobs.duckdb.org/ci/spark-3.5.3-bin-hadoop3.tgz
-          tar xf spark-3.5.3-bin-hadoop3.tgz
-          cat spark-test.sql
-          java -version
-          java ${{ github.workspace }}/src/test/external/RunSpark.java spark-test.sql
-
-  java-linux-amd64-asan:
-    name: Linux ASan (amd64)
-    runs-on: ubuntu-latest
-    needs: java-linux-amd64
-    env:
-      GEN: ninja
-      CC: 'ccache gcc'
-      CXX: 'ccache g++'
-      CCACHE_DIR: ${{ github.workspace }}/ccache
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Dependencies
-        run: |
-          echo "set man-db/auto-update false" | sudo debconf-communicate
-          sudo dpkg-reconfigure man-db
-          sudo apt-get update -y -q -o=Dpkg::Use-Pty=0
-          sudo apt-get install -y -q -o=Dpkg::Use-Pty=0 \
-            ccache \
-            ninja-build
-
-      - name: Cache Key
-        id: cache_key
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"-asan
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build (patched)
-        if: ${{ inputs.skip_tests != 'true' }}
-        run: |
-          patch -p1 < ./data/asan/appender_asan_failure.patch
-          git diff HEAD
-          make sanitized
-
-      - name: Save Cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
-
-      - name: ASan (patched)
-        if: ${{ inputs.skip_tests != 'true' }}
-        env:
-          LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libasan.so.8 /usr/lib/x86_64-linux-gnu/libstdc++.so.6"
-        run: |
-          java \
-            -cp ./build/sanitized/duckdb_jdbc_nolib.jar:./build/sanitized/duckdb_jdbc_tests.jar \
-            org.duckdb.TestDuckDBJDBC \
-            quick \
-            > asan_patched.log 2>&1 \
-            || true
-          cat asan_patched.log
-          grep heap-use-after-free asan_patched.log
-          grep Java_org_duckdb_DuckDBBindings_duckdb_1appender_1create_1ext asan_patched.log
-          grep ABORTING asan_patched.log
-
-      - name: Build
-        if: ${{ inputs.skip_tests != 'true' }}
-        run: |
-          git checkout src/jni/bindings_appender.cpp
-          git status
-          make sanitized
-
-      - name: ASan
-        if: ${{ inputs.skip_tests != 'true' }}
-        env:
-          LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libasan.so.8 /usr/lib/x86_64-linux-gnu/libstdc++.so.6"
-        run: |
-          java \
-            -cp ./build/sanitized/duckdb_jdbc_nolib.jar:./build/sanitized/duckdb_jdbc_tests.jar \
-            org.duckdb.TestDuckDBJDBC \
-            quick \
-            > asan.log 2>&1 \
-            || true
-          grep -qPz "TestDuckDBJDBC#test_write_map success in 0 seconds\nOK" asan.log
-          if grep -q ABORTING asan.log; then
-            exit 1
-          fi
-
-      - name: Upload Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: asan.log
-          path: |
-            asan.log
-
-  java-linux-amd64-jepsen:
-    name: Linux Jepsen (amd64)
-    runs-on: ubuntu-latest
-    needs: java-linux-amd64
-    env:
-      MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Checkout Jepsen
-        uses: actions/checkout@v4
-        with:
-          repository: jepsen-io/duckdb
-          ref: 95731d970339780b934ac106831d704ce3ad23ba
-          path: jepsen
-
-      - name: Cache Key
-        id: cache_key
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build
-        uses: ./.github/composite-actions/linux-build-docker
-        with:
-          docker_image: '${{ env.MANYLINUX_IMAGE }}'
-
-      - name: Install Dependencies 
-        run: |
-          echo "set man-db/auto-update false" | sudo debconf-communicate
-          sudo dpkg-reconfigure man-db
-          sudo apt-get update -y -q -o=Dpkg::Use-Pty=0
-          sudo apt-get install -y -q -o=Dpkg::Use-Pty=0 \
-            gnuplot \
-            graphviz \
-            leiningen
-
-      - name: Setup Default Java
-        run: |
-          echo "JAVA_HOME=${JAVA_HOME_21_X64}" >> $GITHUB_ENV
-          echo "${JAVA_HOME_21_X64}/bin" >> $GITHUB_PATH
-          sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
-          sudo update-alternatives --set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac
-          /usr/bin/java --version
-
-      - name: Install JAR
-        run: |
-          mvn -B -ntp --version
-          mvn -B -ntp install:install-file \
-            -Dfile=${{ github.workspace }}/build/release/duckdb_jdbc.jar \
-            -DgroupId=org.duckdb \
-            -DartifactId=duckdb_jdbc \
-            -Dversion=1-jepsen \
-            -Dpackaging=jar
-
-      - name: Run Jepsen
-        working-directory: jepsen
-        run: |
-          patch -p1 < ${{ github.workspace }}/data/jepsen/jepsen.patch
-          lein --version
-          lein run test \
-            --time-limit 10 \
-            --max-writes-per-key 8 \
-            --concurrency 5 \
-            --rate 1000 \
-            --log-sql \
-            --upsert merge-into \
-            --duckdb-log \
-            | grep -v '^INFO' \
-            | tee jepsen.log
-          tail -n 1 jepsen.log | grep -q '^Everything looks good!'
-
-      - name: Zip Results
-        if: always()
-        working-directory: jepsen
-        run: |
-          zip -qyr store.zip store
-
-      - name: Upload Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: jepsen
-          path: |
-            jepsen/store.zip
-
-  java-linux-aarch64:
-    name: Linux (aarch64)
-    runs-on: ubuntu-24.04-arm
-    needs: java-linux-amd64
-    env:
-      MANYLINUX_IMAGE: quay.io/pypa/manylinux_2_28_aarch64
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cache Key
-        id: cache_key
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build
-        uses: ./.github/composite-actions/linux-build-docker
-        with:
-          docker_image: '${{ env.MANYLINUX_IMAGE }}'
-
-      - name: Save Cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
-
-      - name: List Symbols
-        run: |
-          nm -gU ./build/release/libduckdb_java.so_linux_arm64
-
-      - name: JDBC Tests EL8
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: ./.github/composite-actions/linux-tests-docker
-        with:
-          docker_image: '${{ env.MANYLINUX_IMAGE }}'
-
-      - name: JDBC Tests
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: ./.github/composite-actions/linux-tests-host
-
-      - name: Deploy
-        shell: bash
-        run: |
-          cp build/release/duckdb_jdbc.jar duckdb_jdbc-linux-aarch64.jar
-          ./scripts/upload-assets-to-staging.sh github_release duckdb_jdbc-linux-aarch64.jar
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: java-linux-aarch64
-          path: |
-            build/release/duckdb_jdbc.jar
-
-  java-linux-amd64-musl:
-    name: Linux (amd64-musl)
-    runs-on: ubuntu-latest
-    needs: java-linux-amd64
-    env:
-      ALPINE_IMAGE: alpine:3.22
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cache Key
-        id: cache_key
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"-musl
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build
-        uses: ./.github/composite-actions/linux-build-musl-docker
-        with:
-          docker_image: '${{ env.ALPINE_IMAGE }}'
-
-      - name: Save Cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
-
-      - name: List Symbols
-        run: |
-          nm -gU ./build/release/libduckdb_java.so_linux_amd64
-
-      - name: JDBC Tests
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: ./.github/composite-actions/linux-tests-musl-docker
-        with:
-          docker_image: '${{ env.ALPINE_IMAGE }}'
-
-      - name: Deploy
-        shell: bash
-        run: |
-          cp build/release/duckdb_jdbc.jar duckdb_jdbc-linux-amd64-musl.jar
-          ./scripts/upload-assets-to-staging.sh github_release duckdb_jdbc-linux-amd64-musl.jar
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: java-linux-amd64-musl
-          path: |
-            build/release/duckdb_jdbc.jar
-
-  java-linux-aarch64-musl:
-    name: Linux (aarch64-musl)
-    runs-on: ubuntu-24.04-arm
-    needs: java-linux-amd64
-    env:
-      ALPINE_IMAGE: alpine:3.22
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Cache Key
-        id: cache_key
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"-musl
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build
-        uses: ./.github/composite-actions/linux-build-musl-docker
-        with:
-          docker_image: '${{ env.ALPINE_IMAGE }}'
-
-      - name: Save Cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
-
-      - name: List Symbols
-        run: |
-          nm -gU ./build/release/libduckdb_java.so_linux_arm64
-
-      - name: JDBC Tests
-        if: ${{ inputs.skip_tests != 'true' }}
-        uses: ./.github/composite-actions/linux-tests-musl-docker
-        with:
-          docker_image: '${{ env.ALPINE_IMAGE }}'
-
-      - name: Deploy
-        shell: bash
-        run: |
-          cp build/release/duckdb_jdbc.jar duckdb_jdbc-linux-aarch64-musl.jar
-          ./scripts/upload-assets-to-staging.sh github_release duckdb_jdbc-linux-aarch64-musl.jar
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: java-linux-aarch64-musl
-          path: |
-            build/release/duckdb_jdbc.jar
+          path: dist/jdbc/*
+          if-no-files-found: error
+          retention-days: 14
 
   java-windows-amd64:
     name: Windows (amd64)
     runs-on: windows-latest
-    needs: java-linux-amd64
-    env:
-      CC: 'ccache cl'
-      CXX: 'ccache cl'
-      CCACHE_DIR: ${{ github.workspace }}/ccache
+    needs: format-check
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.git_ref }}
 
-      - name: Dependencies
-        shell: bash
-        run: |
-          choco install \
-            ccache \
-            -y --force --no-progress
-
-      - name: Cache Key
-        id: cache_key
-        shell: bash
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
+      - name: Setup JDK 8
+        uses: actions/setup-java@v4
         with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
+          distribution: 'temurin'
+          java-version: '8'
 
-      - name: Build
+      - name: Setup MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v4
+
+      - name: Configure & Build
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          mkdir build
-          cd build
-          mkdir release
-          cd release
-          cmake ../.. -G Ninja -DCMAKE_BUILD_TYPE=Release
+          mkdir build\release
+          cd build\release
+          cmake ..\..\ -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release
 
-      - name: Save Cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
-
-      - name: List Symbols
+      - name: Verify artifacts
         shell: cmd
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          dumpbin.exe /imports build\release\libduckdb_java.so_windows_amd64
-          dumpbin.exe /exports build\release\libduckdb_java.so_windows_amd64
+          echo ===== build\release 产物 =====
+          dir build\release
+          echo ===== DLL 架构信息 =====
+          dumpbin.exe /headers build\release\libduckdb_java.so_windows_amd64 | findstr /C:"machine"
 
       - name: Java Tests
         if: ${{ inputs.skip_tests != 'true' }}
@@ -692,104 +147,27 @@ jobs:
           java -version
           make test
 
-      - name: Deploy
+      - name: Collect artifacts
         shell: bash
         run: |
-          cp build/release/duckdb_jdbc.jar duckdb_jdbc-windows-amd64.jar
-          ./scripts/upload-assets-to-staging.sh github_release duckdb_jdbc-windows-amd64.jar
+          mkdir -p dist/jdbc
+          cp build/release/libduckdb_java.so_windows_amd64 dist/jdbc/
+          cp build/release/duckdb_jdbc.jar               dist/jdbc/ || true
+          cp build/release/duckdb_jdbc_tests.jar         dist/jdbc/ || true
+          echo "===== dist/jdbc 产物 ====="
+          ls -lh dist/jdbc/
 
       - uses: actions/upload-artifact@v4
         with:
           name: java-windows-amd64
-          path: |
-            build/release/duckdb_jdbc.jar
-
-  java-windows-aarch64:
-    name: Windows (aarch64)
-    runs-on: windows-11-arm
-    needs: java-linux-amd64
-    env:
-      CC: 'ccache cl'
-      CXX: 'ccache cl'
-      CCACHE_DIR: ${{ github.workspace }}/ccache
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.git_ref }}
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Dependencies
-        shell: bash
-        run: |
-          choco install \
-            ccache \
-            -y --force --no-progress
-
-      - name: Cache Key
-        id: cache_key
-        shell: bash
-        run: |
-          DUCKDB_VERSION=$(python ./scripts/print_duckdb_version.py)
-          KEY="${{ runner.os }}-${{ runner.arch }}-$DUCKDB_VERSION"
-          echo "value=${KEY}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }}
-
-      - name: Build
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsarm64.bat"
-          mkdir build
-          cd build
-          mkdir release
-          cd release
-          cmake ../.. -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build . --config Release
-
-      - name: Save Cache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
-
-      - name: List Symbols
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsarm64.bat"
-          dumpbin.exe /imports build\release\libduckdb_java.so_windows_arm64
-          dumpbin.exe /exports build\release\libduckdb_java.so_windows_arm64
-
-      - name: Java Tests
-        if: ${{ inputs.skip_tests != 'true' }}
-        shell: bash
-        run: |
-          java -version
-          make test
-
-      - name: Deploy
-        shell: bash
-        run: |
-          cp build/release/duckdb_jdbc.jar duckdb_jdbc-windows-aarch64.jar
-          ./scripts/upload-assets-to-staging.sh github_release duckdb_jdbc-windows-aarch64.jar
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: java-windows-aarch64
-          path: |
-            build/release/duckdb_jdbc.jar
+          path: dist/jdbc/*
+          if-no-files-found: error
+          retention-days: 14
 
   java-osx-universal:
     name: macOS (Universal)
     runs-on: macos-latest
-    needs: java-linux-amd64
+    needs: format-check
     env:
       GEN: ninja
       CC: 'ccache clang'
@@ -831,230 +209,34 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/ccache
-          key: ${{ steps.cache_key.outputs.value }} 
+          key: ${{ steps.cache_key.outputs.value }}
 
       - name: List Symbols
         run: |
           nm -gU ./build/release/libduckdb_java.so_osx_universal
+
+      - name: Verify universal binary
+        shell: bash
+        run: lipo -archs build/release/libduckdb_java.so_osx_universal | grep "x86_64 arm64"
 
       - name: Java Tests
         if: ${{ inputs.skip_tests != 'true' }}
         shell: bash
         run: make test
 
-      - name: See if this actually universal
-        shell: bash
-        run: lipo -archs build/release/libduckdb_java.so_osx_universal | grep "x86_64 arm64"
-
-      - name: Deploy
+      - name: Collect artifacts
         shell: bash
         run: |
-          cp build/release/duckdb_jdbc.jar duckdb_jdbc-osx-universal.jar
-          ./scripts/upload-assets-to-staging.sh github_release duckdb_jdbc-osx-universal.jar
+          mkdir -p dist/jdbc
+          cp build/release/libduckdb_java.so_osx_universal dist/jdbc/
+          cp build/release/duckdb_jdbc.jar                 dist/jdbc/ || true
+          cp build/release/duckdb_jdbc_tests.jar           dist/jdbc/ || true
+          echo "===== dist/jdbc 产物 ====="
+          ls -lh dist/jdbc/
 
       - uses: actions/upload-artifact@v4
         with:
           name: java-osx-universal
-          path: |
-            build/release/duckdb_jdbc.jar
-
-  maven-deploy:
-    if: ${{ github.repository == 'duckdb/duckdb-java' && inputs.override_git_describe == '' && startsWith(github.ref, 'refs/tags/') }}
-    name: Maven Deploy
-    runs-on: ubuntu-latest
-    needs:
-      - java-linux-amd64
-      - java-linux-amd64-tck
-      - java-linux-amd64-spark
-      - java-linux-amd64-asan
-      - java-linux-amd64-jepsen
-      - java-linux-aarch64
-      - java-linux-amd64-musl
-      - java-linux-aarch64-musl
-      - java-windows-amd64
-      - java-windows-aarch64
-      - java-osx-universal
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - shell: bash
-        run: mkdir jdbc-artifacts
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-amd64
-          path: jdbc-artifacts/java-linux-amd64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-aarch64
-          path: jdbc-artifacts/java-linux-aarch64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-amd64-musl
-          path: jdbc-artifacts/java-linux-amd64-musl
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-aarch64-musl
-          path: jdbc-artifacts/java-linux-aarch64-musl
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-windows-amd64
-          path: jdbc-artifacts/java-windows-amd64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-windows-aarch64
-          path: jdbc-artifacts/java-windows-aarch64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-osx-universal
-          path: jdbc-artifacts/java-osx-universal
-
-      - name: Combine JARs
-        shell: bash
-        env:
-          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
-        run: |
-          mkdir -m  700 -p ~/.gnupg
-          echo -e "passphrase asdf\npinentry-mode loopback\nno-tty\nbatch\n" > ~/.gnupg/gpg.conf
-          echo "${{ secrets.MAVEN_PGP_PK }}" | base64 -d > maven_pgp_key
-          gpg --batch --import maven_pgp_key
-          python ./scripts/jdbc_maven_deploy.py ${{ github.ref_name }} jdbc-artifacts .
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: java-jars
-          path: |
-            jdbc-artifacts
-
-  # Publish SNAPSHOT builds to Maven Central Snapshots repository on main branch
-  # SNAPSHOTs don't require GPG signatures or validation
-  # See: https://central.sonatype.org/publish/publish-portal-snapshots/
-  maven-snapshot-deploy:
-    if: ${{ github.repository == 'duckdb/duckdb-java' && github.ref == 'refs/heads/v1.5-variegata' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
-    name: Maven SNAPSHOT Deploy
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs:
-      - java-linux-amd64
-      - java-linux-amd64-tck
-      - java-linux-amd64-spark
-      - java-linux-amd64-asan
-      - java-linux-amd64-jepsen
-      - java-linux-aarch64
-      - java-linux-amd64-musl
-      - java-linux-aarch64-musl
-      - java-windows-amd64
-      - java-windows-aarch64
-      - java-osx-universal
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: '11'
-          distribution: 'temurin'
-
-      - shell: bash
-        run: mkdir jdbc-artifacts
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-amd64
-          path: jdbc-artifacts/java-linux-amd64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-aarch64
-          path: jdbc-artifacts/java-linux-aarch64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-amd64-musl
-          path: jdbc-artifacts/java-linux-amd64-musl
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-linux-aarch64-musl
-          path: jdbc-artifacts/java-linux-aarch64-musl
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-windows-amd64
-          path: jdbc-artifacts/java-windows-amd64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-windows-aarch64
-          path: jdbc-artifacts/java-windows-aarch64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: java-osx-universal
-          path: jdbc-artifacts/java-osx-universal
-
-      - name: Deploy SNAPSHOT to Maven Central
-        shell: bash
-        env:
-          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
-          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
-        run: |
-          python ./scripts/jdbc_maven_deploy_snapshot.py jdbc-artifacts .
-
-  java-merge-vendoring-pr:
-    name: Merge vendoring PR 
-    if: ${{ github.repository == 'duckdb/duckdb-java' && github.event_name == 'pull_request' && github.head_ref == format('vendoring-{0}', github.base_ref) }}
-    needs:
-      - java-linux-amd64
-      - java-linux-amd64-tck
-      - java-linux-amd64-spark
-      - java-linux-amd64-asan
-      - java-linux-amd64-jepsen
-      - java-linux-aarch64
-      - java-linux-amd64-musl
-      - java-linux-aarch64-musl
-      - java-windows-amd64
-      - java-windows-aarch64
-      - java-osx-universal
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Merge vendoring PR
-        id: merge_vendoring_pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-            echo "Merging PR number: ${{ github.event.pull_request.number }} with message: ${{ github.event.pull_request.title }}"
-            gh pr merge vendoring-${{ github.base_ref }} \
-             --rebase \
-             --subject "${{ github.event.pull_request.title }}" \
-             --body ""
-
-      - name: Update vendoring branch
-        id: update_vendoring_branch
-        if: ${{ steps.merge_vendoring_pr.outcome == 'success' }}
-        run: |
-            # Delete vendoring-${{ github.base_ref }} branch and re-create it for future PRs
-            git push --delete origin vendoring-${{ github.base_ref }}
-            git checkout --track origin/${{ github.base_ref }}
-            git pull --ff-only
-            git branch vendoring-${{ github.base_ref }}
-            git push origin vendoring-${{ github.base_ref }}
+          path: dist/jdbc/*
+          if-no-files-found: error
+          retention-days: 14
